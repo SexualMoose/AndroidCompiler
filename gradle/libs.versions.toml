@@ -16,6 +16,7 @@ coreKtx = "1.15.0"
 lifecycleRuntime = "2.8.7"
 serialization = "1.7.3"
 apksig = "8.7.3"
+documentfile = "1.0.1"
 
 [libraries]
 # Compose
@@ -52,6 +53,9 @@ serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serializ
 
 # APK Signing
 apksig = { group = "com.android.tools.build", name = "apksig", version.ref = "apksig" }
+
+# DocumentFile
+documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
 
 # Build logic dependencies
 android-gradlePlugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }

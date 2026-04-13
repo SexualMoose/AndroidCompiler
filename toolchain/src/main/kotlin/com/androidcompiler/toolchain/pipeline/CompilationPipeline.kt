@@ -3,6 +3,7 @@ package com.androidcompiler.toolchain.pipeline
 import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.CompilationStep
 import com.androidcompiler.core.common.model.ErrorSeverity
+import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -33,23 +34,43 @@ class CompilationPipeline @Inject constructor(
     private val dexCompiler: DexCompiler,
     private val apkPackager: ApkPackager,
     private val apkAligner: ApkAligner,
-    private val apkSigner: ApkSigner
+    private val apkSigner: ApkSigner,
+    private val registry: ToolchainRegistry
 ) {
+    fun isToolchainReady(): Boolean = registry.isAllInstalled()
+
     suspend fun compile(
         zipPath: String,
         outputDir: File,
-        toolchainDir: File,
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult = withContext(Dispatchers.Default) {
+        val toolchainDir = registry.toolchainDir
+        val buildDir = File(outputDir, "build").apply {
+            if (exists()) deleteRecursively()
+            mkdirs()
+        }
+        val androidJarPath = registry.getAndroidJar().absolutePath
 
-        val buildDir = File(outputDir, "build").apply { mkdirs() }
-        val androidJarPath = File(toolchainDir, "android.jar").absolutePath
+        if (!registry.isAllInstalled()) {
+            return@withContext CompilationResult.Failure(
+                listOf(CompilationError("Setup", ErrorSeverity.ERROR, "Toolchain components not fully installed. Go to Components tab to download.")),
+                CompilationStep.EXTRACTING
+            )
+        }
 
         // Step 1: Extract
         onProgress(CompilationStep.EXTRACTING, 0f)
         onLog("Extracting project...", ErrorSeverity.INFO)
-        val projectDir = projectExtractor.extract(zipPath, buildDir)
+        val projectDir = try {
+            projectExtractor.extract(zipPath, buildDir)
+        } catch (e: Exception) {
+            return@withContext CompilationResult.Failure(
+                listOf(CompilationError("Extract", ErrorSeverity.ERROR, "Failed to extract ZIP: ${e.message}")),
+                CompilationStep.EXTRACTING
+            )
+        }
+        onLog("Project extracted to: ${projectDir.name}", ErrorSeverity.INFO)
         onProgress(CompilationStep.EXTRACTING, 1f)
 
         val context = CompilationContext(
@@ -65,8 +86,10 @@ class CompilationPipeline @Inject constructor(
         onLog("Compiling resources with AAPT2...", ErrorSeverity.INFO)
         val resourceResult = resourceCompiler.compile(context)
         if (resourceResult is StepResult.Failure) {
+            onLog("Resource compilation failed", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(resourceResult.errors, CompilationStep.COMPILING_RESOURCES)
         }
+        onLog("Resources compiled successfully", ErrorSeverity.INFO)
         onProgress(CompilationStep.COMPILING_RESOURCES, 1f)
 
         // Step 3: Compile Sources
@@ -74,17 +97,21 @@ class CompilationPipeline @Inject constructor(
         onLog("Compiling source files...", ErrorSeverity.INFO)
         val sourceResult = sourceCompiler.compile(context)
         if (sourceResult is StepResult.Failure) {
+            onLog("Source compilation failed with ${sourceResult.errors.size} error(s)", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(sourceResult.errors, CompilationStep.COMPILING_SOURCES)
         }
+        onLog("Source compilation successful", ErrorSeverity.INFO)
         onProgress(CompilationStep.COMPILING_SOURCES, 1f)
 
         // Step 4: DEX
         onProgress(CompilationStep.DEXING, 0f)
-        onLog("Converting to DEX...", ErrorSeverity.INFO)
+        onLog("Converting to DEX format...", ErrorSeverity.INFO)
         val dexResult = dexCompiler.compile(context)
         if (dexResult is StepResult.Failure) {
+            onLog("DEX conversion failed", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(dexResult.errors, CompilationStep.DEXING)
         }
+        onLog("DEX conversion successful", ErrorSeverity.INFO)
         onProgress(CompilationStep.DEXING, 1f)
 
         // Step 5: Package
@@ -92,8 +119,10 @@ class CompilationPipeline @Inject constructor(
         onLog("Packaging APK...", ErrorSeverity.INFO)
         val packageResult = apkPackager.packageApk(context)
         if (packageResult is StepResult.Failure) {
+            onLog("APK packaging failed", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(packageResult.errors, CompilationStep.PACKAGING)
         }
+        onLog("APK packaged", ErrorSeverity.INFO)
         onProgress(CompilationStep.PACKAGING, 1f)
 
         // Step 6: Align
@@ -101,8 +130,10 @@ class CompilationPipeline @Inject constructor(
         onLog("Aligning APK...", ErrorSeverity.INFO)
         val alignResult = apkAligner.align(context)
         if (alignResult is StepResult.Failure) {
+            onLog("APK alignment failed", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(alignResult.errors, CompilationStep.ALIGNING)
         }
+        onLog("APK aligned", ErrorSeverity.INFO)
         onProgress(CompilationStep.ALIGNING, 1f)
 
         // Step 7: Sign
@@ -110,12 +141,17 @@ class CompilationPipeline @Inject constructor(
         onLog("Signing APK...", ErrorSeverity.INFO)
         val signResult = apkSigner.sign(context)
         if (signResult is StepResult.Failure) {
+            onLog("APK signing failed", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(signResult.errors, CompilationStep.SIGNING)
         }
         onProgress(CompilationStep.SIGNING, 1f)
 
         val apkFile = (signResult as StepResult.Success).outputs.first()
-        onLog("Build complete: ${apkFile.name}", ErrorSeverity.INFO)
+        onLog("Build complete: ${apkFile.name} (${apkFile.length() / 1024} KB)", ErrorSeverity.INFO)
+
+        // Clean up build intermediates
+        try { buildDir.deleteRecursively() } catch (_: Exception) {}
+
         CompilationResult.Success(apkFile)
     }
 }

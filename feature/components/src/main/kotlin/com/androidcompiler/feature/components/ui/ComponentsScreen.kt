@@ -39,7 +39,10 @@ fun ComponentsScreen(
     viewModel: ComponentsViewModel = hiltViewModel()
 ) {
     val components by viewModel.components.collectAsStateWithLifecycle()
+    val isDownloadingAll by viewModel.isDownloadingAll.collectAsStateWithLifecycle()
     val spacing = LocalSpacing.current
+    val allInstalled = components.all { it.second is ComponentStatus.Installed }
+    val anyNotInstalled = components.any { it.second is ComponentStatus.NotInstalled }
 
     Column(
         modifier = Modifier
@@ -57,10 +60,19 @@ fun ComponentsScreen(
                 text = "Toolchain Components",
                 style = MaterialTheme.typography.headlineMedium
             )
-            FilledTonalButton(onClick = { viewModel.refreshAll() }) {
-                Icon(Icons.Default.Refresh, contentDescription = null)
-                Spacer(Modifier.width(spacing.small))
-                Text("Refresh")
+            Row(horizontalArrangement = Arrangement.spacedBy(spacing.small)) {
+                if (anyNotInstalled && !isDownloadingAll) {
+                    Button(onClick = { viewModel.downloadAll() }) {
+                        Icon(Icons.Default.CloudDownload, contentDescription = null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Download All")
+                    }
+                }
+                FilledTonalButton(onClick = { viewModel.refreshAll() }) {
+                    Icon(Icons.Default.Refresh, contentDescription = null)
+                    Spacer(Modifier.width(4.dp))
+                    Text("Refresh")
+                }
             }
         }
 
