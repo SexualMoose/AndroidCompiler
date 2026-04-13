@@ -18,7 +18,8 @@ data class ToolchainComponent(
 enum class ComponentType {
     JAR,
     NATIVE_BINARY,
-    SDK_PLATFORM
+    SDK_PLATFORM,
+    JDK_ARCHIVE
 }
 
 @Serializable

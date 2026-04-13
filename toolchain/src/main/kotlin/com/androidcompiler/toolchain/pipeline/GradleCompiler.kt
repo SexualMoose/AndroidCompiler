@@ -53,8 +53,8 @@ class GradleCompiler @Inject constructor(
             onLog("No suitable JDK found on device", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "No JDK found. The Android runtime includes a JVM but a full JDK is needed for Gradle builds. " +
-                    "A future update will bundle a portable JDK.")
+                    "No JDK found. Go to the Components tab and ensure 'OpenJDK 17 (ARM64)' is downloaded. " +
+                    "This provides a portable JDK for on-device Gradle builds.")
             ))
         }
 
@@ -212,23 +212,35 @@ class GradleCompiler @Inject constructor(
     }
 
     private fun findJavaHome(): File? {
-        // Check common JDK locations on Android / Termux / rooted devices
-        val candidates = listOf(
-            System.getenv("JAVA_HOME"),
-            "/usr/lib/jvm/java-17-openjdk",
-            "/data/data/com.termux/files/usr",
-            "/system/etc/java"
-        ).filterNotNull()
-
-        for (path in candidates) {
-            val dir = File(path)
-            val javaBin = File(dir, "bin/java")
-            val javaBinExe = File(dir, "bin/java.exe")
-            if (javaBin.exists() || javaBinExe.exists()) return dir
+        // Priority 1: Bundled JDK from toolchain (downloaded on first launch)
+        val bundledJdk = registry.getJavaHome()
+        if (bundledJdk != null) {
+            val javaBin = File(bundledJdk, "bin/java")
+            if (javaBin.exists()) return bundledJdk
         }
 
-        // On Android, the runtime itself can serve as a basic JVM
-        // Check if 'java' is in PATH
+        // Priority 2: Termux JDK
+        val termuxJdk = File("/data/data/com.termux/files/usr")
+        if (File(termuxJdk, "bin/java").exists()) return termuxJdk
+
+        // Priority 3: Environment variable
+        val envJavaHome = System.getenv("JAVA_HOME")
+        if (envJavaHome != null) {
+            val dir = File(envJavaHome)
+            if (File(dir, "bin/java").exists()) return dir
+        }
+
+        // Priority 4: Common system locations
+        val systemCandidates = listOf(
+            "/usr/lib/jvm/java-17-openjdk",
+            "/usr/lib/jvm/java-21-openjdk"
+        )
+        for (path in systemCandidates) {
+            val dir = File(path)
+            if (File(dir, "bin/java").exists()) return dir
+        }
+
+        // Priority 5: Check if java is in PATH
         try {
             val process = ProcessBuilder("java", "-version")
                 .redirectErrorStream(true)
@@ -236,17 +248,9 @@ class GradleCompiler @Inject constructor(
             val output = process.inputStream.bufferedReader().readText()
             process.waitFor()
             if (process.exitValue() == 0 || output.contains("version")) {
-                // java is available in PATH, use parent of bin/java
                 return File(System.getProperty("java.home", "/system"))
             }
         } catch (_: Exception) {}
-
-        // Last resort: use Android's own java.home property
-        val javaHome = System.getProperty("java.home")
-        if (javaHome != null) {
-            val dir = File(javaHome)
-            if (dir.exists()) return dir
-        }
 
         return null
     }
