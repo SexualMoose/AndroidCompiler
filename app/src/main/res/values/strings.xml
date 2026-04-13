@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AndroidCompiler</string>
+    <string name="tab_compiler">Compiler</string>
+    <string name="tab_monitor">Monitor</string>
+    <string name="tab_components">Components</string>
+    <string name="tab_settings">Settings</string>
+</resources>
