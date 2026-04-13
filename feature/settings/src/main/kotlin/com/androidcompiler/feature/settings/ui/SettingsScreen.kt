@@ -18,9 +18,11 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Update
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.Button
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -51,6 +53,7 @@ fun SettingsScreen(
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val isCheckingUpdates by viewModel.isCheckingUpdates.collectAsStateWithLifecycle()
+    val isApplyingUpdates by viewModel.isApplyingUpdates.collectAsStateWithLifecycle()
     val updateMessage by viewModel.updateMessage.collectAsStateWithLifecycle()
     val updateResults by viewModel.updateResults.collectAsStateWithLifecycle()
     val hasDebugKeystore by viewModel.hasDebugKeystore.collectAsStateWithLifecycle()
@@ -245,18 +248,39 @@ fun SettingsScreen(
 
         // Updates Section
         SettingsSection(title = "Updates") {
-            OutlinedButton(
-                onClick = { viewModel.checkForUpdates() },
-                enabled = !isCheckingUpdates,
-                modifier = Modifier.fillMaxWidth()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(spacing.small)
             ) {
-                if (isCheckingUpdates) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                } else {
-                    Icon(Icons.Default.Update, contentDescription = null)
+                OutlinedButton(
+                    onClick = { viewModel.checkForUpdates() },
+                    enabled = !isCheckingUpdates && !isApplyingUpdates,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (isCheckingUpdates) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Default.Update, contentDescription = null)
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (isCheckingUpdates) "Checking..." else "Check Updates")
                 }
-                Spacer(Modifier.width(spacing.small))
-                Text(if (isCheckingUpdates) "Checking..." else "Check for Component Updates")
+                val hasUpdates = updateResults.any { it.hasUpdate }
+                if (hasUpdates) {
+                    Button(
+                        onClick = { viewModel.applyAllUpdates() },
+                        enabled = !isApplyingUpdates,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (isApplyingUpdates) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.SystemUpdate, contentDescription = null)
+                        }
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (isApplyingUpdates) "Updating..." else "Update All")
+                    }
+                }
             }
             updateMessage?.let { msg ->
                 Spacer(Modifier.height(spacing.small))
@@ -269,11 +293,30 @@ fun SettingsScreen(
             if (updateResults.any { it.hasUpdate }) {
                 Spacer(Modifier.height(spacing.small))
                 updateResults.filter { it.hasUpdate }.forEach { info ->
-                    Text(
-                        text = "${info.componentId}: ${info.currentVersion} -> ${info.latestVersion}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = info.displayName,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                text = "${info.currentVersion} \u2192 ${info.latestVersion}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.applySingleUpdate(info.componentId) },
+                            enabled = !isApplyingUpdates
+                        ) {
+                            Text("Update", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
                 }
             }
         }

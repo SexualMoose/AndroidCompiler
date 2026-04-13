@@ -1,6 +1,7 @@
 package com.androidcompiler.toolchain.update
 
 import com.androidcompiler.core.common.model.ToolchainComponent
+import com.androidcompiler.toolchain.download.ComponentDownloadManager
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -16,14 +17,17 @@ import javax.inject.Singleton
 
 data class UpdateInfo(
     val componentId: String,
+    val displayName: String,
     val currentVersion: String,
     val latestVersion: String?,
-    val hasUpdate: Boolean
+    val hasUpdate: Boolean,
+    val updatedComponent: ToolchainComponent? = null
 )
 
 @Singleton
 class ComponentUpdateChecker @Inject constructor(
-    private val registry: ToolchainRegistry
+    private val registry: ToolchainRegistry,
+    private val downloadManager: ComponentDownloadManager
 ) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
@@ -34,6 +38,51 @@ class ComponentUpdateChecker @Inject constructor(
         registry.getComponents().map { component ->
             async(Dispatchers.IO) { checkComponent(component) }
         }.awaitAll()
+    }
+
+    /**
+     * Apply a single component update: delete old file, download new version.
+     */
+    suspend fun applyUpdate(
+        updateInfo: UpdateInfo,
+        onProgress: (Float) -> Unit
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        val updated = updateInfo.updatedComponent
+            ?: return@withContext Result.failure(Exception("No updated component info"))
+
+        // Delete the old file
+        val oldFile = registry.getComponentFile(
+            registry.getComponents().first { it.id == updateInfo.componentId }
+        )
+        if (oldFile.exists()) oldFile.delete()
+
+        // Download the new version
+        val result = downloadManager.downloadComponent(updated, onProgress)
+        if (result.isSuccess) {
+            Result.success(Unit)
+        } else {
+            Result.failure(result.exceptionOrNull() ?: Exception("Download failed"))
+        }
+    }
+
+    /**
+     * Apply all available updates sequentially.
+     */
+    suspend fun applyAllUpdates(
+        updates: List<UpdateInfo>,
+        onComponentProgress: (componentId: String, progress: Float) -> Unit,
+        onComponentComplete: (componentId: String, success: Boolean, error: String?) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        for (update in updates.filter { it.hasUpdate }) {
+            val result = applyUpdate(update) { progress ->
+                onComponentProgress(update.componentId, progress)
+            }
+            onComponentComplete(
+                update.componentId,
+                result.isSuccess,
+                result.exceptionOrNull()?.message
+            )
+        }
     }
 
     private fun checkComponent(component: ToolchainComponent): UpdateInfo {
@@ -51,19 +100,34 @@ class ComponentUpdateChecker @Inject constructor(
             null
         }
 
+        val hasUpdate = latestVersion != null
+                && latestVersion != component.version
+                && compareVersions(latestVersion, component.version) > 0
+
+        // Build an updated component with new version URLs
+        val updatedComponent = if (hasUpdate && latestVersion != null) {
+            component.copy(
+                version = latestVersion,
+                sources = component.sources.map { source ->
+                    source.copy(
+                        url = source.url.replace(component.version, latestVersion)
+                    )
+                }
+            )
+        } else null
+
         return UpdateInfo(
             componentId = component.id,
+            displayName = component.displayName,
             currentVersion = component.version,
             latestVersion = latestVersion,
-            hasUpdate = latestVersion != null && latestVersion != component.version
-                    && compareVersions(latestVersion, component.version) > 0
+            hasUpdate = hasUpdate,
+            updatedComponent = updatedComponent
         )
     }
 
     private fun checkMavenCentral(component: ToolchainComponent): String? {
         val url = component.sources.first { it.mirror == "maven_central" }.url
-        // Extract group:artifact from URL pattern
-        // e.g., https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/3.39.0/ecj-3.39.0.jar
         val parts = url.removePrefix("https://repo1.maven.org/maven2/")
             .split("/")
         if (parts.size < 3) return null
@@ -88,8 +152,6 @@ class ComponentUpdateChecker @Inject constructor(
     }
 
     private fun checkGoogleMaven(component: ToolchainComponent): String? {
-        // Google Maven uses a group-index.xml approach
-        // For simplicity, check the known URL pattern
         val url = component.sources.first { it.mirror == "google_maven" }.url
         val parts = url.removePrefix("https://dl.google.com/android/maven2/")
             .split("/")
@@ -102,7 +164,6 @@ class ComponentUpdateChecker @Inject constructor(
         val body = response.body?.string() ?: return null
         response.close()
 
-        // Simple XML parsing for <latest> or last <version>
         val latestRegex = Regex("<latest>(.+?)</latest>")
         val versionRegex = Regex("<version>(.+?)</version>")
 
@@ -112,7 +173,6 @@ class ComponentUpdateChecker @Inject constructor(
     }
 
     private fun checkGitHub(component: ToolchainComponent): String? {
-        // Extract owner/repo from GitHub URL
         val url = component.sources.first { it.mirror == "github" }.url
         val match = Regex("github.com/([^/]+)/([^/]+)").find(url) ?: return null
         val owner = match.groupValues[1]

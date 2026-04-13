@@ -47,6 +47,9 @@ class SettingsViewModel @Inject constructor(
     private val _updateMessage = MutableStateFlow<String?>(null)
     val updateMessage: StateFlow<String?> = _updateMessage.asStateFlow()
 
+    private val _isApplyingUpdates = MutableStateFlow(false)
+    val isApplyingUpdates: StateFlow<Boolean> = _isApplyingUpdates.asStateFlow()
+
     private val _hasDebugKeystore = MutableStateFlow(keystoreManager.hasDebugKeystore())
     val hasDebugKeystore: StateFlow<Boolean> = _hasDebugKeystore.asStateFlow()
 
@@ -95,6 +98,60 @@ class SettingsViewModel @Inject constructor(
             } finally {
                 _isCheckingUpdates.value = false
             }
+        }
+    }
+
+    fun applyAllUpdates() {
+        val updates = _updateResults.value.filter { it.hasUpdate }
+        if (updates.isEmpty()) return
+
+        _isApplyingUpdates.value = true
+        _updateMessage.value = "Updating ${updates.size} component(s)..."
+        viewModelScope.launch {
+            var successCount = 0
+            var failCount = 0
+            updateChecker.applyAllUpdates(
+                updates = updates,
+                onComponentProgress = { id, progress ->
+                    val name = updates.find { it.componentId == id }?.displayName ?: id
+                    _updateMessage.value = "Updating $name... ${(progress * 100).toInt()}%"
+                },
+                onComponentComplete = { id, success, error ->
+                    if (success) successCount++ else failCount++
+                }
+            )
+            _updateMessage.value = if (failCount == 0) {
+                "$successCount component(s) updated successfully"
+            } else {
+                "$successCount updated, $failCount failed"
+            }
+            // Re-check to clear the update flags
+            _updateResults.value = _updateResults.value.map {
+                if (it.hasUpdate) it.copy(hasUpdate = false) else it
+            }
+            _isApplyingUpdates.value = false
+        }
+    }
+
+    fun applySingleUpdate(componentId: String) {
+        val update = _updateResults.value.find { it.componentId == componentId && it.hasUpdate }
+            ?: return
+
+        _isApplyingUpdates.value = true
+        _updateMessage.value = "Updating ${update.displayName}..."
+        viewModelScope.launch {
+            val result = updateChecker.applyUpdate(update) { progress ->
+                _updateMessage.value = "Updating ${update.displayName}... ${(progress * 100).toInt()}%"
+            }
+            if (result.isSuccess) {
+                _updateMessage.value = "${update.displayName} updated to ${update.latestVersion}"
+                _updateResults.value = _updateResults.value.map {
+                    if (it.componentId == componentId) it.copy(hasUpdate = false) else it
+                }
+            } else {
+                _updateMessage.value = "Failed to update ${update.displayName}: ${result.exceptionOrNull()?.message}"
+            }
+            _isApplyingUpdates.value = false
         }
     }
 
