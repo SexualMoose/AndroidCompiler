@@ -31,6 +31,8 @@ typealias LogCallback = (message: String, severity: ErrorSeverity) -> Unit
 @Singleton
 class CompilationPipeline @Inject constructor(
     private val projectExtractor: ProjectExtractor,
+    private val projectAnalyzer: ProjectAnalyzer,
+    private val gradleCompiler: GradleCompiler,
     private val resourceCompiler: ResourceCompiler,
     private val sourceCompiler: SourceCompiler,
     private val dexCompiler: DexCompiler,
@@ -60,13 +62,6 @@ class CompilationPipeline @Inject constructor(
         val startTime = System.nanoTime()
         performanceHintHelper.beginCompilationSession()
 
-        if (!registry.isAllInstalled()) {
-            return@withContext CompilationResult.Failure(
-                listOf(CompilationError("Setup", ErrorSeverity.ERROR, "Toolchain components not fully installed. Go to Components tab to download.")),
-                CompilationStep.EXTRACTING
-            )
-        }
-
         // Step 1: Extract
         onProgress(CompilationStep.EXTRACTING, 0f)
         onLog("Extracting project...", ErrorSeverity.INFO)
@@ -81,6 +76,84 @@ class CompilationPipeline @Inject constructor(
         onLog("Project extracted to: ${projectDir.name}", ErrorSeverity.INFO)
         onProgress(CompilationStep.EXTRACTING, 1f)
 
+        // Step 2: Analyze project type
+        val projectInfo = projectAnalyzer.analyze(projectDir)
+        onLog("Project type: ${projectInfo.type.name}", ErrorSeverity.INFO)
+        onLog("Package: ${projectInfo.packageName ?: "unknown"}", ErrorSeverity.INFO)
+        onLog("Source files: ${projectInfo.sourceFiles.size}", ErrorSeverity.INFO)
+
+        // Route to appropriate compilation mode
+        val result = when (projectInfo.type) {
+            ProjectAnalyzer.ProjectType.GRADLE_PROJECT -> {
+                onLog("Using Gradle build system (full project with dependencies)", ErrorSeverity.INFO)
+                compileWithGradle(projectDir, outputDir, projectInfo, onProgress, onLog)
+            }
+            ProjectAnalyzer.ProjectType.SIMPLE_PROJECT -> {
+                if (!registry.isAllInstalled()) {
+                    return@withContext CompilationResult.Failure(
+                        listOf(CompilationError("Setup", ErrorSeverity.ERROR,
+                            "Toolchain components not fully installed. Go to Components tab to download.")),
+                        CompilationStep.EXTRACTING
+                    )
+                }
+                onLog("Using direct compilation (simple project, no external deps)", ErrorSeverity.INFO)
+                compileSimple(projectDir, outputDir, buildDir, toolchainDir, androidJarPath,
+                    incrementalFileNames, onProgress, onLog)
+            }
+            ProjectAnalyzer.ProjectType.UNKNOWN -> {
+                return@withContext CompilationResult.Failure(
+                    listOf(CompilationError("Analyze", ErrorSeverity.ERROR,
+                        "Could not determine project structure. Expected AndroidManifest.xml and source files, " +
+                        "or a Gradle project with build.gradle.kts/settings.gradle.kts.")),
+                    CompilationStep.EXTRACTING
+                )
+            }
+        }
+
+        // Report actual compilation duration for performance hints
+        val duration = System.nanoTime() - startTime
+        performanceHintHelper.reportActualDuration(duration)
+        performanceHintHelper.endSession()
+
+        result
+    }
+
+    private suspend fun compileWithGradle(
+        projectDir: File,
+        outputDir: File,
+        projectInfo: ProjectAnalyzer.ProjectInfo,
+        onProgress: ProgressCallback,
+        onLog: LogCallback
+    ): CompilationResult {
+        onProgress(CompilationStep.COMPILING_SOURCES, 0f)
+        onLog("Starting Gradle build...", ErrorSeverity.INFO)
+
+        val result = gradleCompiler.compile(projectDir, outputDir, projectInfo, onLog)
+
+        return when (result) {
+            is StepResult.Success -> {
+                onProgress(CompilationStep.SIGNING, 1f)
+                val apkFile = result.outputs.first()
+                onLog("BUILD SUCCESSFUL: ${apkFile.name} (${apkFile.length() / 1024} KB)", ErrorSeverity.INFO)
+                CompilationResult.Success(apkFile)
+            }
+            is StepResult.Failure -> {
+                onLog("GRADLE BUILD FAILED with ${result.errors.size} error(s)", ErrorSeverity.ERROR)
+                CompilationResult.Failure(result.errors, CompilationStep.COMPILING_SOURCES)
+            }
+        }
+    }
+
+    private suspend fun compileSimple(
+        projectDir: File,
+        outputDir: File,
+        buildDir: File,
+        toolchainDir: File,
+        androidJarPath: String,
+        incrementalFileNames: Boolean,
+        onProgress: ProgressCallback,
+        onLog: LogCallback
+    ): CompilationResult {
         val context = CompilationContext(
             projectDir = projectDir,
             outputDir = outputDir,
@@ -90,83 +163,67 @@ class CompilationPipeline @Inject constructor(
             incrementalFileNames = incrementalFileNames
         )
 
-        // Step 2: Compile Resources
+        // Resource compilation
         onProgress(CompilationStep.COMPILING_RESOURCES, 0f)
         onLog("Compiling resources with AAPT2...", ErrorSeverity.INFO)
         val resourceResult = resourceCompiler.compile(context)
         if (resourceResult is StepResult.Failure) {
-            onLog("Resource compilation failed", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(resourceResult.errors, CompilationStep.COMPILING_RESOURCES)
+            return CompilationResult.Failure(resourceResult.errors, CompilationStep.COMPILING_RESOURCES)
         }
-        onLog("Resources compiled successfully", ErrorSeverity.INFO)
         onProgress(CompilationStep.COMPILING_RESOURCES, 1f)
 
-        // Step 3: Compile Sources
+        // Source compilation
         onProgress(CompilationStep.COMPILING_SOURCES, 0f)
         onLog("Compiling source files...", ErrorSeverity.INFO)
         val sourceResult = sourceCompiler.compile(context)
         if (sourceResult is StepResult.Failure) {
-            onLog("Source compilation failed with ${sourceResult.errors.size} error(s)", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(sourceResult.errors, CompilationStep.COMPILING_SOURCES)
+            return CompilationResult.Failure(sourceResult.errors, CompilationStep.COMPILING_SOURCES)
         }
-        onLog("Source compilation successful", ErrorSeverity.INFO)
         onProgress(CompilationStep.COMPILING_SOURCES, 1f)
 
-        // Step 4: DEX
+        // DEX
         onProgress(CompilationStep.DEXING, 0f)
         onLog("Converting to DEX format...", ErrorSeverity.INFO)
         val dexResult = dexCompiler.compile(context)
         if (dexResult is StepResult.Failure) {
-            onLog("DEX conversion failed", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(dexResult.errors, CompilationStep.DEXING)
+            return CompilationResult.Failure(dexResult.errors, CompilationStep.DEXING)
         }
-        onLog("DEX conversion successful", ErrorSeverity.INFO)
         onProgress(CompilationStep.DEXING, 1f)
 
-        // Step 5: Package
+        // Package
         onProgress(CompilationStep.PACKAGING, 0f)
         onLog("Packaging APK...", ErrorSeverity.INFO)
         val packageResult = apkPackager.packageApk(context)
         if (packageResult is StepResult.Failure) {
-            onLog("APK packaging failed", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(packageResult.errors, CompilationStep.PACKAGING)
+            return CompilationResult.Failure(packageResult.errors, CompilationStep.PACKAGING)
         }
-        onLog("APK packaged", ErrorSeverity.INFO)
         onProgress(CompilationStep.PACKAGING, 1f)
 
-        // Step 6: Align
+        // Align
         onProgress(CompilationStep.ALIGNING, 0f)
         onLog("Aligning APK...", ErrorSeverity.INFO)
         val alignResult = apkAligner.align(context)
         if (alignResult is StepResult.Failure) {
-            onLog("APK alignment failed", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(alignResult.errors, CompilationStep.ALIGNING)
+            return CompilationResult.Failure(alignResult.errors, CompilationStep.ALIGNING)
         }
-        onLog("APK aligned", ErrorSeverity.INFO)
         onProgress(CompilationStep.ALIGNING, 1f)
 
-        // Step 7: Sign
+        // Sign
         onProgress(CompilationStep.SIGNING, 0f)
         onLog("Signing APK...", ErrorSeverity.INFO)
         val signResult = apkSigner.sign(context)
         if (signResult is StepResult.Failure) {
-            onLog("APK signing failed", ErrorSeverity.ERROR)
-            return@withContext CompilationResult.Failure(signResult.errors, CompilationStep.SIGNING)
+            return CompilationResult.Failure(signResult.errors, CompilationStep.SIGNING)
         }
         onProgress(CompilationStep.SIGNING, 1f)
 
         val apkFile = (signResult as StepResult.Success).outputs.first()
         onLog("Build complete: ${apkFile.name} (${apkFile.length() / 1024} KB)", ErrorSeverity.INFO)
 
-        // Report actual compilation duration for performance hints
-        val duration = System.nanoTime() - startTime
-        performanceHintHelper.reportActualDuration(duration)
-        performanceHintHelper.endSession()
-
         // Clean up build intermediates
         try { buildDir.deleteRecursively() } catch (_: Exception) {}
 
-        CompilationResult.Success(apkFile)
+        return CompilationResult.Success(apkFile)
     }
 }
 

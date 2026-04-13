@@ -10,9 +10,11 @@ sealed interface CompilationState {
 
 enum class CompilationStep(val displayName: String) {
     EXTRACTING("Extracting project"),
+    ANALYZING("Analyzing project"),
     COMPILING_RESOURCES("Compiling resources"),
     GENERATING_R("Generating R.java"),
     COMPILING_SOURCES("Compiling sources"),
+    GRADLE_BUILD("Gradle build"),
     DEXING("Converting to DEX"),
     PACKAGING("Packaging APK"),
     ALIGNING("Aligning APK"),
