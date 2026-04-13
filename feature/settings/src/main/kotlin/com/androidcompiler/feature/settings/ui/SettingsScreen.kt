@@ -9,14 +9,21 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Update
+import androidx.compose.material.icons.filled.Upload
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -43,6 +50,11 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val isCheckingUpdates by viewModel.isCheckingUpdates.collectAsStateWithLifecycle()
+    val updateMessage by viewModel.updateMessage.collectAsStateWithLifecycle()
+    val updateResults by viewModel.updateResults.collectAsStateWithLifecycle()
+    val hasDebugKeystore by viewModel.hasDebugKeystore.collectAsStateWithLifecycle()
+    val keystoreMessage by viewModel.keystoreMessage.collectAsStateWithLifecycle()
     val spacing = LocalSpacing.current
 
     val inputFolderPicker = rememberLauncherForActivityResult(
@@ -52,6 +64,10 @@ fun SettingsScreen(
     val outputFolderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri -> uri?.let { viewModel.setDefaultOutputFolder(it.toString()) } }
+
+    val keystorePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri -> uri?.let { viewModel.importKeystore(it, "android") } }
 
     Column(
         modifier = Modifier
@@ -70,10 +86,7 @@ fun SettingsScreen(
 
         // Appearance Section
         SettingsSection(title = "Appearance") {
-            Text(
-                text = "Theme",
-                style = MaterialTheme.typography.bodyLarge
-            )
+            Text("Theme", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(spacing.small))
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 ThemeMode.entries.forEachIndexed { index, mode ->
@@ -111,9 +124,7 @@ fun SettingsScreen(
                     )
                 }
             }
-
             Spacer(Modifier.height(spacing.medium))
-
             Text("Network Types", style = MaterialTheme.typography.bodyLarge)
             Spacer(Modifier.height(spacing.small))
             Row {
@@ -142,22 +153,18 @@ fun SettingsScreen(
             ) {
                 Icon(Icons.Default.FolderOpen, contentDescription = null)
                 Spacer(Modifier.width(spacing.small))
-                Text(settings.defaultInputFolder?.let { "Input: $it" } ?: "Set Default Input Folder")
+                Text(settings.defaultInputFolder?.let { "Input: ${it.takeLast(30)}" } ?: "Set Default Input Folder")
             }
-
             Spacer(Modifier.height(spacing.small))
-
             OutlinedButton(
                 onClick = { outputFolderPicker.launch(null) },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(Icons.Default.FolderOpen, contentDescription = null)
                 Spacer(Modifier.width(spacing.small))
-                Text(settings.defaultOutputFolder?.let { "Output: $it" } ?: "Set Default Output Folder")
+                Text(settings.defaultOutputFolder?.let { "Output: ${it.takeLast(30)}" } ?: "Set Default Output Folder")
             }
-
             Spacer(Modifier.height(spacing.medium))
-
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -179,15 +186,95 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(spacing.medium))
 
+        // Signing Section
+        SettingsSection(title = "APK Signing") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Key,
+                    contentDescription = null,
+                    tint = if (hasDebugKeystore) MaterialTheme.colorScheme.tertiary
+                           else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.width(spacing.small))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Debug Keystore", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        if (hasDebugKeystore) "Ready (RSA 2048-bit)" else "Not created",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (!hasDebugKeystore) {
+                    Button(onClick = { viewModel.generateDebugKeystore() }) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("Create")
+                    }
+                } else {
+                    Icon(
+                        Icons.Default.CheckCircle,
+                        contentDescription = "Ready",
+                        tint = MaterialTheme.colorScheme.tertiary
+                    )
+                }
+            }
+            Spacer(Modifier.height(spacing.medium))
+            OutlinedButton(
+                onClick = { keystorePicker.launch(arrayOf("application/octet-stream", "*/*")) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Upload, contentDescription = null)
+                Spacer(Modifier.width(spacing.small))
+                Text("Import Custom Keystore")
+            }
+            keystoreMessage?.let { msg ->
+                Spacer(Modifier.height(spacing.small))
+                Text(
+                    text = msg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (msg.startsWith("Failed")) MaterialTheme.colorScheme.error
+                           else MaterialTheme.colorScheme.tertiary
+                )
+            }
+        }
+
+        Spacer(Modifier.height(spacing.medium))
+
         // Updates Section
         SettingsSection(title = "Updates") {
             OutlinedButton(
                 onClick = { viewModel.checkForUpdates() },
+                enabled = !isCheckingUpdates,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Default.Update, contentDescription = null)
+                if (isCheckingUpdates) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Update, contentDescription = null)
+                }
                 Spacer(Modifier.width(spacing.small))
-                Text("Check for Component Updates")
+                Text(if (isCheckingUpdates) "Checking..." else "Check for Component Updates")
+            }
+            updateMessage?.let { msg ->
+                Spacer(Modifier.height(spacing.small))
+                Text(
+                    text = msg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (updateResults.any { it.hasUpdate }) {
+                Spacer(Modifier.height(spacing.small))
+                updateResults.filter { it.hasUpdate }.forEach { info ->
+                    Text(
+                        text = "${info.componentId}: ${info.currentVersion} -> ${info.latestVersion}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
 
@@ -195,12 +282,9 @@ fun SettingsScreen(
 
         // About Section
         SettingsSection(title = "About") {
+            Text("AndroidCompiler v1.0.0", style = MaterialTheme.typography.bodyLarge)
             Text(
-                text = "AndroidCompiler v1.0.0",
-                style = MaterialTheme.typography.bodyLarge
-            )
-            Text(
-                text = "On-device Android project compilation",
+                "On-device Android project compilation",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

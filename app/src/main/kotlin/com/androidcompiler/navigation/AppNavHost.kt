@@ -1,5 +1,6 @@
 package com.androidcompiler.navigation
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
@@ -28,10 +29,12 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.androidcompiler.feature.compiler.ui.CompilerScreen
 import com.androidcompiler.feature.components.ui.ComponentsScreen
+import com.androidcompiler.feature.components.ui.SetupScreen
 import com.androidcompiler.feature.monitor.ui.MonitorScreen
 import com.androidcompiler.feature.settings.ui.SettingsScreen
 import kotlinx.serialization.Serializable
 
+@Serializable data object SetupRoute
 @Serializable data object CompilerRoute
 @Serializable data object MonitorRoute
 @Serializable data object ComponentsRoute
@@ -52,47 +55,61 @@ val topLevelDestinations = listOf(
 )
 
 @Composable
-fun AppNavHost() {
+fun AppNavHost(needsSetup: Boolean = false) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
 
+    val isOnSetup = currentDestination?.hasRoute(SetupRoute::class) == true
+
     Scaffold(
         bottomBar = {
-            NavigationBar {
-                topLevelDestinations.forEach { destination ->
-                    val selected = currentDestination?.hierarchy?.any {
-                        it.hasRoute(destination.route::class)
-                    } == true
+            // Hide bottom bar during setup
+            AnimatedVisibility(visible = !isOnSetup) {
+                NavigationBar {
+                    topLevelDestinations.forEach { destination ->
+                        val selected = currentDestination?.hierarchy?.any {
+                            it.hasRoute(destination.route::class)
+                        } == true
 
-                    NavigationBarItem(
-                        selected = selected,
-                        onClick = {
-                            navController.navigate(destination.route) {
-                                popUpTo(navController.graph.findStartDestination().id) {
-                                    saveState = true
+                        NavigationBarItem(
+                            selected = selected,
+                            onClick = {
+                                navController.navigate(destination.route) {
+                                    popUpTo(navController.graph.findStartDestination().id) {
+                                        saveState = true
+                                    }
+                                    launchSingleTop = true
+                                    restoreState = true
                                 }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        },
-                        icon = {
-                            Icon(
-                                imageVector = if (selected) destination.selectedIcon else destination.unselectedIcon,
-                                contentDescription = destination.label
-                            )
-                        },
-                        label = { Text(destination.label) }
-                    )
+                            },
+                            icon = {
+                                Icon(
+                                    imageVector = if (selected) destination.selectedIcon else destination.unselectedIcon,
+                                    contentDescription = destination.label
+                                )
+                            },
+                            label = { Text(destination.label) }
+                        )
+                    }
                 }
             }
         }
     ) { innerPadding ->
         NavHost(
             navController = navController,
-            startDestination = CompilerRoute,
+            startDestination = if (needsSetup) SetupRoute else CompilerRoute,
             modifier = Modifier.padding(innerPadding)
         ) {
+            composable<SetupRoute> {
+                SetupScreen(
+                    onSetupComplete = {
+                        navController.navigate(CompilerRoute) {
+                            popUpTo(SetupRoute) { inclusive = true }
+                        }
+                    }
+                )
+            }
             composable<CompilerRoute> { CompilerScreen() }
             composable<MonitorRoute> { MonitorScreen() }
             composable<ComponentsRoute> { ComponentsScreen() }

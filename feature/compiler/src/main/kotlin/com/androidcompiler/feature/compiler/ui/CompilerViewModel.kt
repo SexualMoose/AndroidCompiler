@@ -102,6 +102,7 @@ class CompilerViewModel @Inject constructor(
             val result = compilationPipeline.compile(
                 zipPath = tempZip.absolutePath,
                 outputDir = outputDir,
+                incrementalFileNames = settings.incrementalFileNames,
                 onProgress = { step, progress ->
                     _compilationState.value = CompilationState.Compiling(step, progress)
                 },

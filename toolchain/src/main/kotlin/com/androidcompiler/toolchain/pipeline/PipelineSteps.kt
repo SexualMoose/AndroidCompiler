@@ -644,7 +644,12 @@ class ApkSigner @Inject constructor(
         val projectName = context.projectDir.name
             .replace(Regex("[^a-zA-Z0-9_-]"), "_")
             .ifEmpty { "output" }
-        val signedApk = File(context.outputDir, "$projectName.apk")
+
+        val signedApk = if (context.incrementalFileNames) {
+            findNextIncrementalFile(context.outputDir, projectName)
+        } else {
+            File(context.outputDir, "$projectName.apk")
+        }
 
         if (!alignedApk.exists()) {
             return@withContext StepResult.Failure(listOf(
@@ -671,6 +676,19 @@ fun findManifest(projectDir: File): File? {
         "AndroidManifest.xml"
     )
     return candidates.map { File(projectDir, it) }.firstOrNull { it.exists() }
+}
+
+fun findNextIncrementalFile(outputDir: File, baseName: String): File {
+    val base = File(outputDir, "$baseName.apk")
+    if (!base.exists()) return base
+
+    var version = 2
+    while (true) {
+        val candidate = File(outputDir, "${baseName}_v$version.apk")
+        if (!candidate.exists()) return candidate
+        version++
+        if (version > 9999) return File(outputDir, "${baseName}_${System.currentTimeMillis()}.apk")
+    }
 }
 
 data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: String)

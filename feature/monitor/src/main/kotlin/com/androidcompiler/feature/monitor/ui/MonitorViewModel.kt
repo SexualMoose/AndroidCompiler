@@ -2,6 +2,8 @@ package com.androidcompiler.feature.monitor.ui
 
 import android.app.ActivityManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.TrafficStats
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -10,6 +12,7 @@ import com.androidcompiler.core.common.model.GpuStatus
 import com.androidcompiler.core.common.model.NetworkInterfaceInfo
 import com.androidcompiler.core.common.model.NetworkThroughput
 import com.androidcompiler.core.common.model.RamUsage
+import com.androidcompiler.toolchain.compute.GpuHasher
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -20,11 +23,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.RandomAccessFile
+import java.net.NetworkInterface
 import javax.inject.Inject
 
 @HiltViewModel
 class MonitorViewModel @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val gpuHasher: GpuHasher
 ) : ViewModel() {
 
     private val _cpuUsage = MutableStateFlow(CpuUsage(0f, emptyList()))
@@ -33,8 +38,7 @@ class MonitorViewModel @Inject constructor(
     private val _ramUsage = MutableStateFlow(RamUsage(0, 0, 0, 0))
     val ramUsage: StateFlow<RamUsage> = _ramUsage.asStateFlow()
 
-    private val _gpuStatus = MutableStateFlow(GpuStatus.IDLE)
-    val gpuStatus: StateFlow<GpuStatus> = _gpuStatus.asStateFlow()
+    val gpuStatus: StateFlow<GpuStatus> = gpuHasher.status
 
     private val _networkThroughput = MutableStateFlow(NetworkThroughput(0, 0, emptyList()))
     val networkThroughput: StateFlow<NetworkThroughput> = _networkThroughput.asStateFlow()
@@ -67,9 +71,8 @@ class MonitorViewModel @Inject constructor(
         val overall = longArrayOf(0, 0)
         val cores = mutableListOf<LongArray>()
         try {
-            val reader = RandomAccessFile("/proc/stat", "r")
-            reader.use {
-                var line = it.readLine()
+            RandomAccessFile("/proc/stat", "r").use { reader ->
+                var line = reader.readLine()
                 while (line != null) {
                     if (line.startsWith("cpu")) {
                         val parts = line.trim().split("\\s+".toRegex())
@@ -87,12 +90,10 @@ class MonitorViewModel @Inject constructor(
                     } else if (!line.startsWith("cpu")) {
                         break
                     }
-                    line = it.readLine()
+                    line = reader.readLine()
                 }
             }
-        } catch (_: Exception) {
-            // /proc/stat may not be accessible on all devices
-        }
+        } catch (_: Exception) { }
         return overall to cores
     }
 
@@ -121,27 +122,63 @@ class MonitorViewModel @Inject constructor(
     }
 
     private suspend fun monitorNetwork() = withContext(Dispatchers.IO) {
-        var prevRx = TrafficStats.getTotalRxBytes()
-        var prevTx = TrafficStats.getTotalTxBytes()
+        val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+        // Track per-interface bytes for delta calculation
+        var prevInterfaceBytes = readInterfaceBytes()
+        var prevTotalRx = TrafficStats.getTotalRxBytes()
+        var prevTotalTx = TrafficStats.getTotalTxBytes()
+
         while (true) {
             delay(1000)
-            val currRx = TrafficStats.getTotalRxBytes()
-            val currTx = TrafficStats.getTotalTxBytes()
-            val mobileRx = TrafficStats.getMobileRxBytes()
-            val mobileTx = TrafficStats.getMobileTxBytes()
+            val currTotalRx = TrafficStats.getTotalRxBytes()
+            val currTotalTx = TrafficStats.getTotalTxBytes()
+            val currInterfaceBytes = readInterfaceBytes()
 
-            val totalDownSpeed = currRx - prevRx
-            val totalUpSpeed = currTx - prevTx
+            val totalDownSpeed = currTotalRx - prevTotalRx
+            val totalUpSpeed = currTotalTx - prevTotalTx
 
+            // Build per-interface breakdown
             val interfaces = mutableListOf<NetworkInterfaceInfo>()
-            if (mobileRx > 0) {
-                interfaces.add(
-                    NetworkInterfaceInfo("Mobile", "Cellular", 0, 0)
-                )
+
+            // Identify interface types from ConnectivityManager
+            val activeNetworks = connectivityManager.allNetworks
+            val interfaceTypes = mutableMapOf<String, String>()
+
+            for (network in activeNetworks) {
+                val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
+                val linkProps = connectivityManager.getLinkProperties(network) ?: continue
+                val ifaceName = linkProps.interfaceName ?: continue
+                val type = when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "Cellular"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+                    else -> "Other"
+                }
+                interfaceTypes[ifaceName] = type
             }
-            interfaces.add(
-                NetworkInterfaceInfo("Total", "All", totalDownSpeed, totalUpSpeed)
-            )
+
+            // Calculate per-interface speed deltas
+            for ((ifaceName, currBytes) in currInterfaceBytes) {
+                val prevBytes = prevInterfaceBytes[ifaceName] ?: continue
+                val rxSpeed = currBytes.first - prevBytes.first
+                val txSpeed = currBytes.second - prevBytes.second
+
+                if (rxSpeed > 0 || txSpeed > 0) {
+                    val type = interfaceTypes[ifaceName] ?: classifyInterface(ifaceName)
+                    interfaces.add(
+                        NetworkInterfaceInfo(
+                            name = ifaceName,
+                            type = type,
+                            downloadBytesPerSec = rxSpeed,
+                            uploadBytesPerSec = txSpeed
+                        )
+                    )
+                }
+            }
+
+            // Sort: most active interfaces first
+            interfaces.sortByDescending { it.downloadBytesPerSec + it.uploadBytesPerSec }
 
             _networkThroughput.value = NetworkThroughput(
                 downloadBytesPerSec = totalDownSpeed,
@@ -149,8 +186,45 @@ class MonitorViewModel @Inject constructor(
                 activeInterfaces = interfaces
             )
 
-            prevRx = currRx
-            prevTx = currTx
+            prevTotalRx = currTotalRx
+            prevTotalTx = currTotalTx
+            prevInterfaceBytes = currInterfaceBytes
         }
+    }
+
+    /**
+     * Read per-interface RX/TX bytes from /proc/net/dev
+     */
+    private fun readInterfaceBytes(): Map<String, Pair<Long, Long>> {
+        val result = mutableMapOf<String, Pair<Long, Long>>()
+        try {
+            RandomAccessFile("/proc/net/dev", "r").use { reader ->
+                // Skip header lines
+                reader.readLine()
+                reader.readLine()
+                var line = reader.readLine()
+                while (line != null) {
+                    val parts = line.trim().split("\\s+".toRegex())
+                    if (parts.size >= 10) {
+                        val ifaceName = parts[0].removeSuffix(":")
+                        if (ifaceName != "lo") { // Skip loopback
+                            val rxBytes = parts[1].toLongOrNull() ?: 0
+                            val txBytes = parts[9].toLongOrNull() ?: 0
+                            result[ifaceName] = rxBytes to txBytes
+                        }
+                    }
+                    line = reader.readLine()
+                }
+            }
+        } catch (_: Exception) { }
+        return result
+    }
+
+    private fun classifyInterface(name: String): String = when {
+        name.startsWith("wlan") -> "Wi-Fi"
+        name.startsWith("rmnet") || name.startsWith("ccmni") -> "Cellular"
+        name.startsWith("eth") -> "Ethernet"
+        name.startsWith("tun") || name.startsWith("vpn") -> "VPN"
+        else -> "Other"
     }
 }

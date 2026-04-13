@@ -3,6 +3,7 @@ package com.androidcompiler.toolchain.pipeline
 import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.CompilationStep
 import com.androidcompiler.core.common.model.ErrorSeverity
+import com.androidcompiler.toolchain.compute.PerformanceHintHelper
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -15,7 +16,8 @@ data class CompilationContext(
     val outputDir: File,
     val buildDir: File,
     val toolchainDir: File,
-    val androidJarPath: String
+    val androidJarPath: String,
+    val incrementalFileNames: Boolean = true
 )
 
 sealed interface CompilationResult {
@@ -35,13 +37,15 @@ class CompilationPipeline @Inject constructor(
     private val apkPackager: ApkPackager,
     private val apkAligner: ApkAligner,
     private val apkSigner: ApkSigner,
-    private val registry: ToolchainRegistry
+    private val registry: ToolchainRegistry,
+    private val performanceHintHelper: PerformanceHintHelper
 ) {
     fun isToolchainReady(): Boolean = registry.isAllInstalled()
 
     suspend fun compile(
         zipPath: String,
         outputDir: File,
+        incrementalFileNames: Boolean = true,
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult = withContext(Dispatchers.Default) {
@@ -51,6 +55,10 @@ class CompilationPipeline @Inject constructor(
             mkdirs()
         }
         val androidJarPath = registry.getAndroidJar().absolutePath
+
+        // Start performance hint session for big.LITTLE optimization
+        val startTime = System.nanoTime()
+        performanceHintHelper.beginCompilationSession()
 
         if (!registry.isAllInstalled()) {
             return@withContext CompilationResult.Failure(
@@ -78,7 +86,8 @@ class CompilationPipeline @Inject constructor(
             outputDir = outputDir,
             buildDir = buildDir,
             toolchainDir = toolchainDir,
-            androidJarPath = androidJarPath
+            androidJarPath = androidJarPath,
+            incrementalFileNames = incrementalFileNames
         )
 
         // Step 2: Compile Resources
@@ -148,6 +157,11 @@ class CompilationPipeline @Inject constructor(
 
         val apkFile = (signResult as StepResult.Success).outputs.first()
         onLog("Build complete: ${apkFile.name} (${apkFile.length() / 1024} KB)", ErrorSeverity.INFO)
+
+        // Report actual compilation duration for performance hints
+        val duration = System.nanoTime() - startTime
+        performanceHintHelper.reportActualDuration(duration)
+        performanceHintHelper.endSession()
 
         // Clean up build intermediates
         try { buildDir.deleteRecursively() } catch (_: Exception) {}

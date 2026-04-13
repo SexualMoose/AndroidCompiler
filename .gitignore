@@ -22,3 +22,4 @@ release/
 *.jks
 *.keystore
 !gradle/wrapper/gradle-wrapper.jar
+build-logic/convention/build/

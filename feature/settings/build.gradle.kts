@@ -5,3 +5,8 @@ plugins {
 android {
     namespace = "com.androidcompiler.feature.settings"
 }
+
+dependencies {
+    implementation(project(":toolchain"))
+    implementation(libs.documentfile)
+}
