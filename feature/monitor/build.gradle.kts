@@ -5,3 +5,7 @@ plugins {
 android {
     namespace = "com.androidcompiler.feature.monitor"
 }
+
+dependencies {
+    implementation(project(":toolchain"))
+}

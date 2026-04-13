@@ -65,7 +65,7 @@ class PerformanceHintHelper @Inject constructor() {
      * Update the target duration if compilation characteristics change.
      */
     fun updateTargetDuration(targetDurationNanos: Long) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.T) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
 
         try {
             val s = session ?: return
