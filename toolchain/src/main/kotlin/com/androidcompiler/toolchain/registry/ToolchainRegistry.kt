@@ -162,6 +162,31 @@ class ToolchainRegistry @Inject constructor(
 
     fun isJdkInstalled(): Boolean = getJavaHome() != null
 
+    // --- Installed version tracking ---
+    // Stores which version is actually installed (may differ from registry default after updates)
+    private val versionsFile: File
+        get() = File(toolchainDir, "installed_versions.properties")
+
+    fun getInstalledVersion(componentId: String): String? {
+        if (!versionsFile.exists()) return null
+        val props = java.util.Properties()
+        try {
+            versionsFile.inputStream().use { props.load(it) }
+        } catch (_: Exception) { return null }
+        return props.getProperty(componentId)
+    }
+
+    fun saveInstalledVersion(componentId: String, version: String) {
+        val props = java.util.Properties()
+        try {
+            if (versionsFile.exists()) versionsFile.inputStream().use { props.load(it) }
+        } catch (_: Exception) { }
+        props.setProperty(componentId, version)
+        try {
+            versionsFile.outputStream().use { props.store(it, "Installed toolchain component versions") }
+        } catch (_: Exception) { }
+    }
+
     fun getEcjJar(): File = File(toolchainDir, "ecj.jar")
     fun getKotlincJar(): File = File(toolchainDir, "kotlin-compiler-embeddable.jar")
     fun getKotlinStdlibJar(): File = File(toolchainDir, "kotlin-stdlib.jar")

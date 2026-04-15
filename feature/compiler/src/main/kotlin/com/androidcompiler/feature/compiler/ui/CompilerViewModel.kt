@@ -9,6 +9,7 @@ import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.CompilationState
 import com.androidcompiler.core.common.model.CompilationStep
 import com.androidcompiler.core.common.model.ErrorSeverity
+import com.androidcompiler.core.common.util.UriPathResolver
 import com.androidcompiler.core.data.repository.SettingsRepository
 import com.androidcompiler.toolchain.pipeline.CompilationPipeline
 import com.androidcompiler.toolchain.pipeline.CompilationResult
@@ -91,13 +92,10 @@ class CompilerViewModel @Inject constructor(
 
             addLog("ZIP file: ${tempZip.length() / 1024} KB", ErrorSeverity.INFO)
 
-            // Determine output directory
+            // Determine output directory (resolve SAF content URIs to real paths)
             val settings = settingsRepository.settings.first()
-            val outputDir = if (settings.defaultOutputFolder != null) {
-                File(settings.defaultOutputFolder!!).apply { mkdirs() }
-            } else {
-                File(context.getExternalFilesDir(null), "output").apply { mkdirs() }
-            }
+            val outputDir = UriPathResolver.resolveOutputDir(context, settings.defaultOutputFolder)
+            addLog("Output directory: ${outputDir.absolutePath}", ErrorSeverity.INFO)
 
             val result = compilationPipeline.compile(
                 zipPath = tempZip.absolutePath,
