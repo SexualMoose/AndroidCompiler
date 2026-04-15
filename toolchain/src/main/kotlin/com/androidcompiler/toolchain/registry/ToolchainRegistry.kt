@@ -93,17 +93,17 @@ class ToolchainRegistry @Inject constructor(
             installPath = "r8.jar"
         ),
         ToolchainComponent(
-            id = "jdk",
-            displayName = "OpenJDK 17 (ARM64)",
-            version = "17",
-            sizeBytes = 178_257_920, // ~170MB
-            type = ComponentType.JDK_ARCHIVE,
+            id = "gradle-wrapper",
+            displayName = "Gradle Wrapper",
+            version = "8.11.1",
+            sizeBytes = 43_583,
+            type = ComponentType.JAR,
             sources = listOf(
-                DownloadSource("https://api.adoptium.net/v3/binary/latest/17/ga/linux/aarch64/jdk/hotspot/normal/eclipse", "adoptium", 1),
-                DownloadSource("https://corretto.aws/downloads/latest/amazon-corretto-17-aarch64-linux-jdk.tar.gz", "corretto", 2)
+                DownloadSource("https://raw.githubusercontent.com/gradle/gradle/v8.11.1/gradle/wrapper/gradle-wrapper.jar", "github", 1),
+                DownloadSource("https://services.gradle.org/distributions/gradle-8.11.1-bin.zip", "gradle", 2)
             ),
             sha256 = "",
-            installPath = "jdk"
+            installPath = "gradle-wrapper.jar"
         ),
         ToolchainComponent(
             id = "android-jar",
