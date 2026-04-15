@@ -16,16 +16,19 @@ import javax.inject.Singleton
 /**
  * Compiles full Gradle-based Android projects on-device.
  *
- * KEY ANDROID CONSTRAINTS:
- * 1. /data partition is mounted noexec — can't execute scripts or binaries from app data
- * 2. Standard Linux JDKs (glibc) can't run on Android (Bionic libc)
- * 3. Only /system binaries (/system/bin/sh, /system/bin/app_process) are executable
+ * ANDROID CONSTRAINTS:
+ * 1. /data is noexec — can't execute ANY file from app data directory
+ * 2. Standard Linux JDKs (glibc) won't run on Android (Bionic libc)
+ * 3. app_process crashes (SIGABRT) because it tries to init Zygote/framework
  *
- * SOLUTION:
- * - Invoke /system/bin/app_process directly to run Gradle's JVM code
- * - app_process is Android's native mechanism for running Java on ART
- * - For any forked sub-processes, create a java shim invoked via /system/bin/sh
- * - Configure Gradle to minimize process forking
+ * SOLUTION: Use dalvikvm64 — Android's standalone JVM runner.
+ * Unlike app_process, dalvikvm runs Java classes directly on ART without
+ * initializing the Android framework. It accepts java-compatible arguments:
+ *   dalvikvm64 -cp classpath MainClass [args]
+ *
+ * For Gradle's spawned sub-processes (kotlinc, etc.), we create a symlink:
+ *   synthetic-jdk/bin/java → /system/bin/dalvikvm64
+ * Symlinks bypass noexec because the kernel resolves to the target on /system.
  */
 @Singleton
 class GradleCompiler @Inject constructor(
@@ -48,74 +51,79 @@ class GradleCompiler @Inject constructor(
 
         onLog("Detected Gradle project: ${projectInfo.packageName ?: projectDir.name}", ErrorSeverity.INFO)
 
-        // Step 1: Set up synthetic JDK with java shim for sub-processes
-        setupSyntheticJdk(onLog)
-        val javaHome = syntheticJdkDir
-        onLog("JAVA_HOME: ${javaHome.absolutePath}", ErrorSeverity.INFO)
+        // Step 1: Find dalvikvm binary
+        val dalvikvm = findDalvikvm()
+        if (dalvikvm == null) {
+            return@withContext StepResult.Failure(listOf(
+                CompilationError("Gradle", ErrorSeverity.ERROR,
+                    "dalvikvm not found on device. Expected at /system/bin/dalvikvm64 or /system/bin/dalvikvm.")
+            ))
+        }
+        onLog("Using: ${dalvikvm.absolutePath}", ErrorSeverity.INFO)
 
-        // Step 2: Ensure the project has a Gradle wrapper JAR
+        // Step 2: Set up synthetic JDK with java → dalvikvm symlink
+        setupSyntheticJdk(dalvikvm, onLog)
+        onLog("JAVA_HOME: ${syntheticJdkDir.absolutePath}", ErrorSeverity.INFO)
+
+        // Step 3: Ensure gradle-wrapper.jar
         val wrapperJar = ensureGradleWrapperJar(projectDir, onLog)
         if (wrapperJar == null) {
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "Could not locate gradle-wrapper.jar. Ensure it's downloaded in Components.")
+                    "gradle-wrapper.jar not found. Download it from the Components tab.")
             ))
         }
-        onLog("Wrapper JAR: ${wrapperJar.absolutePath} (${wrapperJar.length()} bytes)", ErrorSeverity.INFO)
+        onLog("Wrapper: ${wrapperJar.name} (${wrapperJar.length()} bytes)", ErrorSeverity.INFO)
 
-        // Step 3: Find or skip Android SDK
+        // Step 4: Android SDK
         val androidSdk = findAndroidSdk()
         if (androidSdk != null) {
             File(projectDir, "local.properties")
                 .writeText("sdk.dir=${androidSdk.absolutePath.replace("\\", "/")}\n")
             onLog("Android SDK: ${androidSdk.absolutePath}", ErrorSeverity.INFO)
         } else {
-            onLog("No local Android SDK — Gradle will download build tools", ErrorSeverity.WARNING)
+            onLog("No local Android SDK — Gradle will attempt to download build tools", ErrorSeverity.WARNING)
         }
 
-        // Step 4: Inject gradle.properties to minimize forking and configure for ART
+        // Step 5: Configure gradle.properties for on-device builds
         injectGradleProperties(projectDir, onLog)
 
-        // Step 5: Build the command
-        // CRITICAL: Execute /system/bin/app_process directly — it's a system binary
-        // that IS executable. Never try to execute files from /data (noexec mount).
-        val classpath = wrapperJar.absolutePath
+        // Step 6: Build and execute the command
+        val gradleHome = File(context.filesDir, "gradle_home").apply { mkdirs() }
 
-        // app_process syntax: app_process [jvm-options] <parent-dir> <main-class> [args]
+        // dalvikvm syntax: dalvikvm [options] -cp classpath class [args]
+        // We invoke via /system/bin/sh -c to set environment variables
         val shellCommand = buildString {
-            append("CLASSPATH='$classpath' ")
-            append("JAVA_HOME='${javaHome.absolutePath}' ")
+            // Environment variables
+            append("JAVA_HOME='${syntheticJdkDir.absolutePath}' ")
             append("ANDROID_HOME='${androidSdk?.absolutePath ?: ""}' ")
             append("ANDROID_SDK_ROOT='${androidSdk?.absolutePath ?: ""}' ")
-            append("GRADLE_USER_HOME='${File(context.filesDir, "gradle_home").apply { mkdirs() }.absolutePath}' ")
-            // Put our synthetic jdk/bin first in PATH so Gradle's forked processes find our java shim
-            append("PATH='${javaHome.absolutePath}/bin:/system/bin:/system/xbin' ")
-            append("exec /system/bin/app_process ")
-            append("-Djava.class.path='$classpath' ")
+            append("GRADLE_USER_HOME='${gradleHome.absolutePath}' ")
+            append("PATH='${syntheticJdkDir.absolutePath}/bin:/system/bin:/system/xbin' ")
+            // dalvikvm invocation
+            append("exec ${dalvikvm.absolutePath} ")
             append("-Dfile.encoding=UTF-8 ")
             append("-Dorg.gradle.appname=gradlew ")
-            append("/ ") // parent dir for app_process
+            append("-Dorg.gradle.java.home='${syntheticJdkDir.absolutePath}' ")
+            append("-cp '${wrapperJar.absolutePath}' ")
             append("org.gradle.wrapper.GradleWrapperMain ")
             append("assembleDebug ")
             append("--no-daemon ")
             append("--console=plain ")
-            append("--warning-mode=all ")
-            append("-Dorg.gradle.java.home='${javaHome.absolutePath}'")
+            append("--warning-mode=all")
         }
 
-        // Use /system/bin/sh to execute — this IS on an exec-mounted partition
         val command = listOf("/system/bin/sh", "-c", shellCommand)
-
-        onLog("Invoking Gradle via app_process...", ErrorSeverity.INFO)
+        onLog("Invoking Gradle via dalvikvm...", ErrorSeverity.INFO)
 
         val result = executeGradleBuild(command, projectDir, onLog)
 
         if (result.exitCode != 0) {
-            val errors = parseGradleErrors(result.stderr + "\n" + result.stdout)
+            val allOutput = result.stderr + "\n" + result.stdout
+            val errors = parseGradleErrors(allOutput)
             return@withContext StepResult.Failure(errors.ifEmpty {
                 listOf(CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "Build failed (exit ${result.exitCode}).\n" +
-                    (result.stderr + "\n" + result.stdout).takeLast(1500)))
+                    "Build failed (exit ${result.exitCode}).\n${allOutput.takeLast(1500)}"))
             })
         }
 
@@ -124,8 +132,8 @@ class GradleCompiler @Inject constructor(
         if (apk == null) {
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "Build completed but no APK found in output directories.\n" +
-                    "stdout: ${result.stdout.takeLast(500)}")
+                    "Build succeeded but no APK found in output directories.\n" +
+                    "stdout tail: ${result.stdout.takeLast(500)}")
             ))
         }
 
@@ -137,111 +145,89 @@ class GradleCompiler @Inject constructor(
     }
 
     /**
-     * Creates a synthetic JAVA_HOME with a `java` shim for Gradle's sub-processes.
-     *
-     * The shim is a shell script that translates java args to app_process format.
-     * It CANNOT be executed directly (noexec on /data), but Gradle invokes java
-     * through the shell, and we ensure /system/bin/sh is used via PATH setup.
-     *
-     * For cases where Gradle tries to exec the java binary directly, we also
-     * create a companion script that the shell-based invocation can use.
+     * Finds the dalvikvm binary. Prefers 64-bit version.
      */
-    private fun setupSyntheticJdk(onLog: LogCallback) {
+    private fun findDalvikvm(): File? {
+        val candidates = listOf(
+            "/system/bin/dalvikvm64",
+            "/system/bin/dalvikvm",
+            "/apex/com.android.art/bin/dalvikvm64",
+            "/apex/com.android.art/bin/dalvikvm"
+        )
+        return candidates.map { File(it) }.firstOrNull { it.exists() }
+    }
+
+    /**
+     * Creates synthetic JAVA_HOME with java → dalvikvm symlink.
+     *
+     * The symlink bypasses /data's noexec restriction because the kernel
+     * resolves the symlink target (/system/bin/dalvikvm64) which IS on
+     * an exec-mounted partition. When Gradle calls $JAVA_HOME/bin/java,
+     * it actually executes dalvikvm64.
+     *
+     * dalvikvm accepts java-compatible arguments: -cp, -D, class name, args.
+     */
+    private fun setupSyntheticJdk(dalvikvm: File, onLog: LogCallback) {
         val binDir = File(syntheticJdkDir, "bin").apply { mkdirs() }
+        val javaLink = File(binDir, "java")
 
-        // The java shim — invoked as: /system/bin/sh /path/to/java [args]
-        File(binDir, "java").writeText("""#!/system/bin/sh
-# AndroidCompiler java shim — routes through app_process on ART
-CLASSPATH=""
-MAIN_CLASS=""
-JVM_ARGS=""
-APP_ARGS=""
-FOUND_MAIN=false
-NEXT_IS_CP=false
-NEXT_IS_JAR=false
+        // Remove old file/symlink if exists
+        if (javaLink.exists()) javaLink.delete()
 
-for arg in "${'$'}@"; do
-    if [ "${'$'}FOUND_MAIN" = "true" ]; then
-        APP_ARGS="${'$'}APP_ARGS ${'$'}arg"
-    elif [ "${'$'}NEXT_IS_CP" = "true" ]; then
-        CLASSPATH="${'$'}arg"
-        NEXT_IS_CP=false
-    elif [ "${'$'}NEXT_IS_JAR" = "true" ]; then
-        CLASSPATH="${'$'}arg"
-        NEXT_IS_JAR=false
-        FOUND_MAIN=true
-    elif [ "${'$'}arg" = "-cp" ] || [ "${'$'}arg" = "-classpath" ]; then
-        NEXT_IS_CP=true
-    elif [ "${'$'}arg" = "-jar" ]; then
-        NEXT_IS_JAR=true
-    elif echo "${'$'}arg" | grep -q "^-D"; then
-        JVM_ARGS="${'$'}JVM_ARGS ${'$'}arg"
-    elif echo "${'$'}arg" | grep -q "^-"; then
-        : # skip unsupported JVM flags silently
-    else
-        MAIN_CLASS="${'$'}arg"
-        FOUND_MAIN=true
-    fi
-done
-
-if [ -z "${'$'}MAIN_CLASS" ] && [ -n "${'$'}CLASSPATH" ]; then
-    MAIN_CLASS=${'$'}(unzip -p "${'$'}CLASSPATH" META-INF/MANIFEST.MF 2>/dev/null | grep "Main-Class:" | head -1 | sed 's/Main-Class: *//' | tr -d '\r')
-fi
-
-if [ -z "${'$'}MAIN_CLASS" ]; then
-    echo "Error: No main class specified" >&2
-    exit 1
-fi
-
-export CLASSPATH
-exec /system/bin/app_process ${'$'}JVM_ARGS / ${'$'}MAIN_CLASS ${'$'}APP_ARGS
+        // Create symlink: java → /system/bin/dalvikvm64
+        try {
+            Os_symlink(dalvikvm.absolutePath, javaLink.absolutePath)
+            onLog("Symlinked java -> ${dalvikvm.absolutePath}", ErrorSeverity.INFO)
+        } catch (e: Exception) {
+            // Fallback: write a shell script (invoked via sh, not directly)
+            onLog("Symlink failed (${e.message}), using shell wrapper", ErrorSeverity.WARNING)
+            javaLink.writeText("""#!/system/bin/sh
+exec ${dalvikvm.absolutePath} "${'$'}@"
 """)
+        }
 
-        // Create a java wrapper that uses sh to invoke the shim
-        // This goes in a PATH-accessible location that sh can find
-        File(binDir, "javac").writeText("#!/system/bin/sh\necho 'javac not available' >&2\nexit 1\n")
-        File(binDir, "jar").writeText("#!/system/bin/sh\necho 'jar not available' >&2\nexit 1\n")
-
-        // Release file so Gradle's toolchain detection recognizes this as a JDK
+        // Release file for Gradle's JDK detection
         File(syntheticJdkDir, "release").writeText("""
 JAVA_VERSION="17.0.0"
-JAVA_VERSION_DATE="2026-01-01"
 OS_ARCH="aarch64"
 OS_NAME="Android"
 IMPLEMENTOR="AndroidCompiler-ART"
 """.trimIndent())
-
-        onLog("Synthetic JDK ready (app_process shim)", ErrorSeverity.INFO)
     }
 
     /**
-     * Injects gradle.properties into the project to configure ART-compatible settings.
-     * Minimizes process forking since forked java processes can't run from /data.
+     * Create a symlink using Android's Os.symlink API.
+     */
+    private fun Os_symlink(target: String, link: String) {
+        // Use reflection to call android.system.Os.symlink() which exists on API 21+
+        val osClass = Class.forName("android.system.Os")
+        val symlinkMethod = osClass.getMethod("symlink", String::class.java, String::class.java)
+        symlinkMethod.invoke(null, target, link)
+    }
+
+    /**
+     * Inject gradle.properties for ART-compatible on-device builds.
      */
     private fun injectGradleProperties(projectDir: File, onLog: LogCallback) {
         val propsFile = File(projectDir, "gradle.properties")
-        val existingProps = if (propsFile.exists()) propsFile.readText() else ""
+        val existing = if (propsFile.exists()) propsFile.readText() else ""
 
-        val injectedProps = buildString {
-            appendLine(existingProps)
+        val injected = buildString {
+            append(existing)
             appendLine()
-            appendLine("# === Injected by AndroidCompiler for on-device builds ===")
-            // Run Kotlin compiler in the Gradle process — don't fork a separate java process
+            appendLine("# === AndroidCompiler on-device build settings ===")
+            // Run kotlinc in Gradle's JVM — don't fork a separate java process
             appendLine("kotlin.compiler.execution.strategy=in-process")
-            // Disable Gradle daemon (we use --no-daemon but belt and suspenders)
             appendLine("org.gradle.daemon=false")
-            // Limit workers to reduce forking pressure
             appendLine("org.gradle.workers.max=2")
-            // Don't use configuration cache (can cause issues on first build)
             appendLine("org.gradle.configuration-cache=false")
-            // Increase memory for in-process builds
             appendLine("org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8")
-            // Parallel execution
             appendLine("org.gradle.parallel=true")
+            appendLine("android.useAndroidX=true")
         }
 
-        propsFile.writeText(injectedProps)
-        onLog("Gradle properties configured for on-device build", ErrorSeverity.INFO)
+        propsFile.writeText(injected)
+        onLog("Gradle properties configured for ART", ErrorSeverity.INFO)
     }
 
     private fun ensureGradleWrapperJar(projectDir: File, onLog: LogCallback): File? {
@@ -250,40 +236,37 @@ IMPLEMENTOR="AndroidCompiler-ART"
         val wrapperProps = File(wrapperDir, "gradle-wrapper.properties")
 
         if (wrapperJar.exists() && wrapperJar.length() > 1000) {
-            onLog("Using project's gradle-wrapper.jar", ErrorSeverity.INFO)
             ensureWrapperProperties(wrapperProps)
             return wrapperJar
         }
 
-        // Try toolchain's bundled copy
+        // Check toolchain
         val toolchainJar = File(registry.toolchainDir, "gradle-wrapper.jar")
         if (toolchainJar.exists() && toolchainJar.length() > 1000) {
             toolchainJar.copyTo(wrapperJar, overwrite = true)
-            onLog("Injected gradle-wrapper.jar from toolchain", ErrorSeverity.INFO)
+            onLog("Injected wrapper JAR from toolchain", ErrorSeverity.INFO)
             ensureWrapperProperties(wrapperProps)
             return wrapperJar
         }
 
         // Search Gradle caches
-        val cacheLocations = listOfNotNull(
+        for (cache in listOf(
             File(context.filesDir, "gradle_home/wrapper/dists"),
             File(System.getProperty("user.home", "/data"), ".gradle/wrapper/dists")
-        )
-        for (cache in cacheLocations) {
+        )) {
             if (cache.exists()) {
                 cache.walkTopDown()
                     .filter { it.name == "gradle-wrapper.jar" && it.length() > 10000 }
                     .firstOrNull()
-                    ?.let { cached ->
-                        cached.copyTo(wrapperJar, overwrite = true)
-                        onLog("Injected gradle-wrapper.jar from Gradle cache", ErrorSeverity.INFO)
+                    ?.let {
+                        it.copyTo(wrapperJar, overwrite = true)
+                        onLog("Injected wrapper JAR from cache", ErrorSeverity.INFO)
                         ensureWrapperProperties(wrapperProps)
                         return wrapperJar
                     }
             }
         }
 
-        onLog("gradle-wrapper.jar not found — download it from Components tab", ErrorSeverity.ERROR)
         return null
     }
 
@@ -301,18 +284,11 @@ zipStorePath=wrapper/dists
     }
 
     private fun findAndroidSdk(): File? {
-        val candidates = listOfNotNull(
+        return listOfNotNull(
             System.getenv("ANDROID_HOME"),
             System.getenv("ANDROID_SDK_ROOT"),
-            "/data/data/com.termux/files/home/android-sdk",
-            "${System.getProperty("user.home")}/Android/Sdk",
-            "${System.getProperty("user.home")}/android-sdk"
-        )
-        for (path in candidates) {
-            val dir = File(path)
-            if (dir.exists() && File(dir, "platforms").exists()) return dir
-        }
-        return null
+            "/data/data/com.termux/files/home/android-sdk"
+        ).map { File(it) }.firstOrNull { it.exists() && File(it, "platforms").exists() }
     }
 
     private fun executeGradleBuild(
@@ -321,11 +297,10 @@ zipStorePath=wrapper/dists
         onLog: LogCallback
     ): ProcessResult {
         try {
-            val processBuilder = ProcessBuilder(command)
+            val process = ProcessBuilder(command)
                 .directory(workingDir)
                 .redirectErrorStream(false)
-
-            val process = processBuilder.start()
+                .start()
 
             val stdoutBuilder = StringBuilder()
             val stderrBuilder = StringBuilder()
@@ -342,8 +317,7 @@ zipStorePath=wrapper/dists
                                 line.startsWith("e:") -> onLog(line, ErrorSeverity.ERROR)
                                 line.startsWith("w:") -> onLog(line, ErrorSeverity.WARNING)
                                 line.contains("Downloading") -> onLog(line, ErrorSeverity.INFO)
-                                line.contains("error:", ignoreCase = true) -> onLog(line, ErrorSeverity.ERROR)
-                                line.contains("FAILURE:") -> onLog(line, ErrorSeverity.ERROR)
+                                line.contains("FAILURE") -> onLog(line, ErrorSeverity.ERROR)
                                 line.startsWith("> ") -> onLog(line, ErrorSeverity.INFO)
                             }
                         }
@@ -371,19 +345,16 @@ zipStorePath=wrapper/dists
 
             return ProcessResult(exitCode, stdoutBuilder.toString(), stderrBuilder.toString())
         } catch (e: Exception) {
-            onLog("Process execution failed: ${e.message}", ErrorSeverity.ERROR)
-            return ProcessResult(-1, "", "Failed to execute: ${e.message}\n${e.stackTraceToString()}")
+            onLog("Process failed: ${e.message}", ErrorSeverity.ERROR)
+            return ProcessResult(-1, "", "Execute failed: ${e.message}\n${e.stackTraceToString()}")
         }
     }
 
     private fun findProducedApk(projectDir: File): File? {
-        val searchDirs = listOf(
-            File(projectDir, "app/build/outputs/apk/debug"),
-            File(projectDir, "app/build/outputs/apk/release"),
-            File(projectDir, "build/outputs/apk/debug"),
-            File(projectDir, "build/outputs/apk/release")
-        )
-        for (dir in searchDirs) {
+        listOf("app/build/outputs/apk/debug", "app/build/outputs/apk/release",
+            "build/outputs/apk/debug", "build/outputs/apk/release"
+        ).forEach { path ->
+            val dir = File(projectDir, path)
             if (dir.exists()) {
                 dir.listFiles()
                     ?.filter { it.extension == "apk" && !it.name.contains("unsigned") }
@@ -399,25 +370,22 @@ zipStorePath=wrapper/dists
     private fun parseGradleErrors(output: String): List<CompilationError> {
         val errors = mutableListOf<CompilationError>()
 
-        val kotlinPattern = Regex("""e: file:///(.+?):(\d+):(\d+): (.+)""")
-        for (match in kotlinPattern.findAll(output)) {
+        Regex("""e: file:///(.+?):(\d+):(\d+): (.+)""").findAll(output).forEach { m ->
             errors.add(CompilationError("kotlinc", ErrorSeverity.ERROR,
-                match.groupValues[4], match.groupValues[1],
-                match.groupValues[2].toIntOrNull(), match.groupValues[3].toIntOrNull(),
+                m.groupValues[4], m.groupValues[1],
+                m.groupValues[2].toIntOrNull(), m.groupValues[3].toIntOrNull(),
                 output.takeLast(2000)))
         }
 
-        val javaPattern = Regex("""(.+\.java):(\d+): error: (.+)""")
-        for (match in javaPattern.findAll(output)) {
+        Regex("""(.+\.java):(\d+): error: (.+)""").findAll(output).forEach { m ->
             errors.add(CompilationError("javac", ErrorSeverity.ERROR,
-                match.groupValues[3], match.groupValues[1],
-                match.groupValues[2].toIntOrNull(), rawOutput = output.takeLast(2000)))
+                m.groupValues[3], m.groupValues[1],
+                m.groupValues[2].toIntOrNull(), rawOutput = output.takeLast(2000)))
         }
 
-        val failurePattern = Regex("""Execution failed for task '(.+?)'\.\s*\n>\s*(.+)""")
-        for (match in failurePattern.findAll(output)) {
+        Regex("""Execution failed for task '(.+?)'\.\s*\n>\s*(.+)""").findAll(output).forEach { m ->
             errors.add(CompilationError("Gradle", ErrorSeverity.ERROR,
-                "Task ${match.groupValues[1]}: ${match.groupValues[2]}",
+                "Task ${m.groupValues[1]}: ${m.groupValues[2]}",
                 rawOutput = output.takeLast(2000)))
         }
 
