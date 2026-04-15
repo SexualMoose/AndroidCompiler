@@ -16,19 +16,16 @@ import javax.inject.Singleton
 /**
  * Compiles full Gradle-based Android projects on-device.
  *
- * ANDROID CONSTRAINTS:
- * 1. /data is noexec — can't execute ANY file from app data directory
- * 2. Standard Linux JDKs (glibc) won't run on Android (Bionic libc)
- * 3. app_process crashes (SIGABRT) because it tries to init Zygote/framework
+ * STRATEGY: Use Termux's JDK if available, otherwise provide clear guidance.
  *
- * SOLUTION: Use dalvikvm64 — Android's standalone JVM runner.
- * Unlike app_process, dalvikvm runs Java classes directly on ART without
- * initializing the Android framework. It accepts java-compatible arguments:
- *   dalvikvm64 -cp classpath MainClass [args]
+ * Why stock Android can't run Gradle directly:
+ * - dalvikvm/ART's URLClassLoader cannot load .class files from JARs
+ * - Gradle's entire plugin system depends on URLClassLoader
+ * - This is a fundamental ART limitation, not a configuration issue
  *
- * For Gradle's spawned sub-processes (kotlinc, etc.), we create a symlink:
- *   synthetic-jdk/bin/java → /system/bin/dalvikvm64
- * Symlinks bypass noexec because the kernel resolves to the target on /system.
+ * What DOES work: Termux installs a Bionic-linked JDK (openjdk-17) that
+ * runs as a full JVM, supporting URLClassLoader and all standard Java APIs.
+ * This compiler detects Termux's JDK and uses it transparently.
  */
 @Singleton
 class GradleCompiler @Inject constructor(
@@ -37,10 +34,11 @@ class GradleCompiler @Inject constructor(
 ) {
     companion object {
         private const val GRADLE_WRAPPER_VERSION = "8.11.1"
+        private val TERMUX_JDK_PATHS = listOf(
+            "/data/data/com.termux/files/usr",
+            "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
+        )
     }
-
-    private val syntheticJdkDir: File
-        get() = File(registry.toolchainDir, "synthetic-jdk")
 
     suspend fun compile(
         projectDir: File,
@@ -51,21 +49,30 @@ class GradleCompiler @Inject constructor(
 
         onLog("Detected Gradle project: ${projectInfo.packageName ?: projectDir.name}", ErrorSeverity.INFO)
 
-        // Step 1: Find dalvikvm binary
-        val dalvikvm = findDalvikvm()
-        if (dalvikvm == null) {
+        // Find a working JDK (Termux)
+        val javaHome = findJavaHome()
+        if (javaHome == null) {
+            onLog("No compatible JDK found on device", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
-                CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "dalvikvm not found on device. Expected at /system/bin/dalvikvm64 or /system/bin/dalvikvm.")
+                CompilationError("Gradle", ErrorSeverity.ERROR, buildString {
+                    appendLine("Gradle projects require a full JDK which is not available on stock Android.")
+                    appendLine()
+                    appendLine("To enable Gradle builds, install Termux from F-Droid and run:")
+                    appendLine("  pkg install openjdk-17")
+                    appendLine()
+                    appendLine("AndroidCompiler will automatically detect and use Termux's JDK.")
+                    appendLine()
+                    appendLine("For simple projects without external dependencies (no Hilt, Compose BOM,")
+                    appendLine("CameraX, etc.), AndroidCompiler's built-in compiler works without Termux.")
+                })
             ))
         }
-        onLog("Using: ${dalvikvm.absolutePath}", ErrorSeverity.INFO)
 
-        // Step 2: Set up synthetic JDK with java → dalvikvm symlink
-        setupSyntheticJdk(dalvikvm, onLog)
-        onLog("JAVA_HOME: ${syntheticJdkDir.absolutePath}", ErrorSeverity.INFO)
+        val javaBin = File(javaHome, "bin/java")
+        onLog("JDK: ${javaHome.absolutePath}", ErrorSeverity.INFO)
+        onLog("java: ${javaBin.absolutePath}", ErrorSeverity.INFO)
 
-        // Step 3: Ensure gradle-wrapper.jar
+        // Ensure wrapper JAR
         val wrapperJar = ensureGradleWrapperJar(projectDir, onLog)
         if (wrapperJar == null) {
             return@withContext StepResult.Failure(listOf(
@@ -73,50 +80,53 @@ class GradleCompiler @Inject constructor(
                     "gradle-wrapper.jar not found. Download it from the Components tab.")
             ))
         }
-        onLog("Wrapper: ${wrapperJar.name} (${wrapperJar.length()} bytes)", ErrorSeverity.INFO)
 
-        // Step 4: Android SDK
+        // Android SDK
         val androidSdk = findAndroidSdk()
         if (androidSdk != null) {
             File(projectDir, "local.properties")
                 .writeText("sdk.dir=${androidSdk.absolutePath.replace("\\", "/")}\n")
             onLog("Android SDK: ${androidSdk.absolutePath}", ErrorSeverity.INFO)
         } else {
-            onLog("No local Android SDK — Gradle will attempt to download build tools", ErrorSeverity.WARNING)
+            onLog("No local Android SDK — Gradle will download build tools", ErrorSeverity.WARNING)
         }
 
-        // Step 5: Configure gradle.properties for on-device builds
+        // Configure for on-device build
         injectGradleProperties(projectDir, onLog)
 
-        // Step 6: Build and execute the command
+        // Build command — use the real JDK's java binary
         val gradleHome = File(context.filesDir, "gradle_home").apply { mkdirs() }
 
-        // dalvikvm syntax: dalvikvm [options] -cp classpath class [args]
-        // We invoke via /system/bin/sh -c to set environment variables
-        val shellCommand = buildString {
-            // Environment variables
-            append("JAVA_HOME='${syntheticJdkDir.absolutePath}' ")
-            append("ANDROID_HOME='${androidSdk?.absolutePath ?: ""}' ")
-            append("ANDROID_SDK_ROOT='${androidSdk?.absolutePath ?: ""}' ")
-            append("GRADLE_USER_HOME='${gradleHome.absolutePath}' ")
-            append("PATH='${syntheticJdkDir.absolutePath}/bin:/system/bin:/system/xbin' ")
-            // dalvikvm invocation
-            append("exec ${dalvikvm.absolutePath} ")
-            append("-Dfile.encoding=UTF-8 ")
-            append("-Dorg.gradle.appname=gradlew ")
-            append("-Dorg.gradle.java.home='${syntheticJdkDir.absolutePath}' ")
-            append("-cp '${wrapperJar.absolutePath}' ")
-            append("org.gradle.wrapper.GradleWrapperMain ")
-            append("assembleDebug ")
-            append("--no-daemon ")
-            append("--console=plain ")
-            append("--warning-mode=all")
+        val command = mutableListOf(
+            javaBin.absolutePath,
+            "-Xmx3g",
+            "-Dfile.encoding=UTF-8",
+            "-Dorg.gradle.appname=gradlew",
+            "-Dorg.gradle.java.home=${javaHome.absolutePath}",
+            "-cp", wrapperJar.absolutePath,
+            "org.gradle.wrapper.GradleWrapperMain",
+            "assembleDebug",
+            "--no-daemon",
+            "--console=plain",
+            "--warning-mode=all"
+        )
+
+        val env = mutableMapOf<String, String>()
+        env["JAVA_HOME"] = javaHome.absolutePath
+        env["ANDROID_HOME"] = androidSdk?.absolutePath ?: ""
+        env["ANDROID_SDK_ROOT"] = androidSdk?.absolutePath ?: ""
+        env["GRADLE_USER_HOME"] = gradleHome.absolutePath
+        env["PATH"] = "${javaHome.absolutePath}/bin:/system/bin:/system/xbin:${System.getenv("PATH") ?: ""}"
+
+        // Termux-specific: ensure LD_LIBRARY_PATH includes Termux's libs
+        val termuxLib = File(javaHome, "lib")
+        if (termuxLib.exists()) {
+            env["LD_LIBRARY_PATH"] = "${termuxLib.absolutePath}:${System.getenv("LD_LIBRARY_PATH") ?: ""}"
         }
 
-        val command = listOf("/system/bin/sh", "-c", shellCommand)
-        onLog("Invoking Gradle via dalvikvm...", ErrorSeverity.INFO)
+        onLog("Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
 
-        val result = executeGradleBuild(command, projectDir, onLog)
+        val result = executeGradleBuild(command, projectDir, env, onLog)
 
         if (result.exitCode != 0) {
             val allOutput = result.stderr + "\n" + result.stdout
@@ -127,13 +137,11 @@ class GradleCompiler @Inject constructor(
             })
         }
 
-        // Find the produced APK
         val apk = findProducedApk(projectDir)
         if (apk == null) {
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
-                    "Build succeeded but no APK found in output directories.\n" +
-                    "stdout tail: ${result.stdout.takeLast(500)}")
+                    "Build completed but no APK found.\n${result.stdout.takeLast(500)}")
             ))
         }
 
@@ -144,70 +152,38 @@ class GradleCompiler @Inject constructor(
         StepResult.Success(listOf(outputApk))
     }
 
-    /**
-     * Finds the dalvikvm binary. Prefers 64-bit version.
-     */
-    private fun findDalvikvm(): File? {
-        val candidates = listOf(
-            "/system/bin/dalvikvm64",
-            "/system/bin/dalvikvm",
-            "/apex/com.android.art/bin/dalvikvm64",
-            "/apex/com.android.art/bin/dalvikvm"
-        )
-        return candidates.map { File(it) }.firstOrNull { it.exists() }
-    }
-
-    /**
-     * Creates synthetic JAVA_HOME with java → dalvikvm symlink.
-     *
-     * The symlink bypasses /data's noexec restriction because the kernel
-     * resolves the symlink target (/system/bin/dalvikvm64) which IS on
-     * an exec-mounted partition. When Gradle calls $JAVA_HOME/bin/java,
-     * it actually executes dalvikvm64.
-     *
-     * dalvikvm accepts java-compatible arguments: -cp, -D, class name, args.
-     */
-    private fun setupSyntheticJdk(dalvikvm: File, onLog: LogCallback) {
-        val binDir = File(syntheticJdkDir, "bin").apply { mkdirs() }
-        val javaLink = File(binDir, "java")
-
-        // Remove old file/symlink if exists
-        if (javaLink.exists()) javaLink.delete()
-
-        // Create symlink: java → /system/bin/dalvikvm64
-        try {
-            Os_symlink(dalvikvm.absolutePath, javaLink.absolutePath)
-            onLog("Symlinked java -> ${dalvikvm.absolutePath}", ErrorSeverity.INFO)
-        } catch (e: Exception) {
-            // Fallback: write a shell script (invoked via sh, not directly)
-            onLog("Symlink failed (${e.message}), using shell wrapper", ErrorSeverity.WARNING)
-            javaLink.writeText("""#!/system/bin/sh
-exec ${dalvikvm.absolutePath} "${'$'}@"
-""")
+    private fun findJavaHome(): File? {
+        // Termux JDK — the only JDK that works on stock Android
+        for (path in TERMUX_JDK_PATHS) {
+            val dir = File(path)
+            if (File(dir, "bin/java").exists()) return dir
         }
 
-        // Release file for Gradle's JDK detection
-        File(syntheticJdkDir, "release").writeText("""
-JAVA_VERSION="17.0.0"
-OS_ARCH="aarch64"
-OS_NAME="Android"
-IMPLEMENTOR="AndroidCompiler-ART"
-""".trimIndent())
+        // Check if Termux has a JDK in a versioned path
+        val jvmDir = File("/data/data/com.termux/files/usr/lib/jvm")
+        if (jvmDir.exists()) {
+            jvmDir.listFiles()?.forEach { child ->
+                if (File(child, "bin/java").exists()) return child
+            }
+        }
+
+        // Environment variable
+        System.getenv("JAVA_HOME")?.let { path ->
+            val dir = File(path)
+            if (File(dir, "bin/java").exists()) return dir
+        }
+
+        return null
     }
 
-    /**
-     * Create a symlink using Android's Os.symlink API.
-     */
-    private fun Os_symlink(target: String, link: String) {
-        // Use reflection to call android.system.Os.symlink() which exists on API 21+
-        val osClass = Class.forName("android.system.Os")
-        val symlinkMethod = osClass.getMethod("symlink", String::class.java, String::class.java)
-        symlinkMethod.invoke(null, target, link)
+    private fun findAndroidSdk(): File? {
+        return listOfNotNull(
+            System.getenv("ANDROID_HOME"),
+            System.getenv("ANDROID_SDK_ROOT"),
+            "/data/data/com.termux/files/home/android-sdk"
+        ).map { File(it) }.firstOrNull { it.exists() && File(it, "platforms").exists() }
     }
 
-    /**
-     * Inject gradle.properties for ART-compatible on-device builds.
-     */
     private fun injectGradleProperties(projectDir: File, onLog: LogCallback) {
         val propsFile = File(projectDir, "gradle.properties")
         val existing = if (propsFile.exists()) propsFile.readText() else ""
@@ -216,7 +192,6 @@ IMPLEMENTOR="AndroidCompiler-ART"
             append(existing)
             appendLine()
             appendLine("# === AndroidCompiler on-device build settings ===")
-            // Run kotlinc in Gradle's JVM — don't fork a separate java process
             appendLine("kotlin.compiler.execution.strategy=in-process")
             appendLine("org.gradle.daemon=false")
             appendLine("org.gradle.workers.max=2")
@@ -225,9 +200,8 @@ IMPLEMENTOR="AndroidCompiler-ART"
             appendLine("org.gradle.parallel=true")
             appendLine("android.useAndroidX=true")
         }
-
         propsFile.writeText(injected)
-        onLog("Gradle properties configured for ART", ErrorSeverity.INFO)
+        onLog("Gradle properties configured", ErrorSeverity.INFO)
     }
 
     private fun ensureGradleWrapperJar(projectDir: File, onLog: LogCallback): File? {
@@ -240,16 +214,14 @@ IMPLEMENTOR="AndroidCompiler-ART"
             return wrapperJar
         }
 
-        // Check toolchain
         val toolchainJar = File(registry.toolchainDir, "gradle-wrapper.jar")
         if (toolchainJar.exists() && toolchainJar.length() > 1000) {
             toolchainJar.copyTo(wrapperJar, overwrite = true)
-            onLog("Injected wrapper JAR from toolchain", ErrorSeverity.INFO)
+            onLog("Injected gradle-wrapper.jar from toolchain", ErrorSeverity.INFO)
             ensureWrapperProperties(wrapperProps)
             return wrapperJar
         }
 
-        // Search Gradle caches
         for (cache in listOf(
             File(context.filesDir, "gradle_home/wrapper/dists"),
             File(System.getProperty("user.home", "/data"), ".gradle/wrapper/dists")
@@ -260,13 +232,11 @@ IMPLEMENTOR="AndroidCompiler-ART"
                     .firstOrNull()
                     ?.let {
                         it.copyTo(wrapperJar, overwrite = true)
-                        onLog("Injected wrapper JAR from cache", ErrorSeverity.INFO)
                         ensureWrapperProperties(wrapperProps)
                         return wrapperJar
                     }
             }
         }
-
         return null
     }
 
@@ -283,23 +253,17 @@ zipStorePath=wrapper/dists
 """.trimIndent())
     }
 
-    private fun findAndroidSdk(): File? {
-        return listOfNotNull(
-            System.getenv("ANDROID_HOME"),
-            System.getenv("ANDROID_SDK_ROOT"),
-            "/data/data/com.termux/files/home/android-sdk"
-        ).map { File(it) }.firstOrNull { it.exists() && File(it, "platforms").exists() }
-    }
-
     private fun executeGradleBuild(
         command: List<String>,
         workingDir: File,
+        env: Map<String, String>,
         onLog: LogCallback
     ): ProcessResult {
         try {
             val process = ProcessBuilder(command)
                 .directory(workingDir)
                 .redirectErrorStream(false)
+                .also { it.environment().putAll(env) }
                 .start()
 
             val stdoutBuilder = StringBuilder()
@@ -338,7 +302,6 @@ zipStorePath=wrapper/dists
 
             stdoutThread.start()
             stderrThread.start()
-
             val exitCode = process.waitFor()
             stdoutThread.join(10000)
             stderrThread.join(10000)
