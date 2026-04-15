@@ -1,6 +1,7 @@
 package com.androidcompiler.toolchain.update
 
 import com.androidcompiler.core.common.model.ComponentType
+import com.androidcompiler.core.common.model.DownloadSource
 import com.androidcompiler.core.common.model.ToolchainComponent
 import com.androidcompiler.toolchain.download.ComponentDownloadManager
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
@@ -26,6 +27,23 @@ data class UpdateInfo(
     val updatedComponent: ToolchainComponent? = null
 )
 
+/**
+ * Only these components can be safely auto-updated because they have
+ * predictable Maven Central URL patterns where version substitution works.
+ *
+ * Components excluded:
+ * - aapt2: URL contains a build number suffix (8.7.3-12006047) that changes per version
+ * - android-jar: version is an API level (35), not semver, and URL structure differs
+ * - gradle-wrapper: tiny file, compatibility-sensitive, URL is to raw GitHub
+ * - kotlin-script-runtime: must match kotlinc version exactly (updated as a group)
+ */
+private val UPDATABLE_COMPONENTS = setOf("ecj", "kotlinc", "kotlin-stdlib", "d8")
+
+/**
+ * Kotlin components that must be updated together to the same version.
+ */
+private val KOTLIN_GROUP = setOf("kotlinc", "kotlin-stdlib", "kotlin-script-runtime")
+
 @Singleton
 class ComponentUpdateChecker @Inject constructor(
     private val registry: ToolchainRegistry,
@@ -38,16 +56,49 @@ class ComponentUpdateChecker @Inject constructor(
         .build()
 
     suspend fun checkAll(): List<UpdateInfo> = coroutineScope {
-        registry.getComponents()
-            .filter { it.type != ComponentType.JDK_ARCHIVE } // JDK updates handled separately
-            .map { component ->
-                async(Dispatchers.IO) { checkComponent(component) }
-            }.awaitAll()
+        val components = registry.getComponents()
+        val updatable = components.filter { it.id in UPDATABLE_COMPONENTS }
+
+        val results = updatable.map { component ->
+            async(Dispatchers.IO) { checkComponent(component) }
+        }.awaitAll()
+
+        // If kotlinc has an update, also mark kotlin-stdlib and kotlin-script-runtime
+        val kotlinUpdate = results.find { it.componentId == "kotlinc" && it.hasUpdate }
+        val finalResults = results.toMutableList()
+
+        if (kotlinUpdate != null) {
+            // Add kotlin-script-runtime as needing update to same version
+            val scriptRuntime = components.find { it.id == "kotlin-script-runtime" }
+            if (scriptRuntime != null) {
+                finalResults.add(UpdateInfo(
+                    componentId = "kotlin-script-runtime",
+                    displayName = scriptRuntime.displayName,
+                    currentVersion = registry.getInstalledVersion(scriptRuntime.id) ?: scriptRuntime.version,
+                    latestVersion = kotlinUpdate.latestVersion,
+                    hasUpdate = true,
+                    updatedComponent = buildUpdatedComponent(scriptRuntime, kotlinUpdate.latestVersion!!)
+                ))
+            }
+        }
+
+        // Add non-updatable components as "up to date" for display
+        val checkedIds = finalResults.map { it.componentId }.toSet()
+        components.filter { it.id !in checkedIds }.forEach { component ->
+            finalResults.add(UpdateInfo(
+                componentId = component.id,
+                displayName = component.displayName,
+                currentVersion = registry.getInstalledVersion(component.id) ?: component.version,
+                latestVersion = null,
+                hasUpdate = false
+            ))
+        }
+
+        finalResults
     }
 
     /**
      * Apply a single component update with rollback on failure.
-     * Backs up the old file, downloads new version, restores backup if download fails.
      */
     suspend fun applyUpdate(
         updateInfo: UpdateInfo,
@@ -57,89 +108,69 @@ class ComponentUpdateChecker @Inject constructor(
             ?: return@withContext Result.failure(Exception("No updated component info"))
 
         val component = registry.getComponents().firstOrNull { it.id == updateInfo.componentId }
-            ?: return@withContext Result.failure(Exception("Component not found in registry"))
+            ?: return@withContext Result.failure(Exception("Component not found"))
 
         val targetFile = registry.getComponentFile(component)
         val backupFile = File(targetFile.parentFile, "${targetFile.name}.backup")
 
-        // Step 1: Backup the existing file
+        // Backup
         try {
             if (targetFile.exists()) {
-                if (targetFile.isDirectory) {
-                    // For JDK directory, skip complex backup
-                    targetFile.renameTo(backupFile)
-                } else {
-                    targetFile.copyTo(backupFile, overwrite = true)
-                }
+                targetFile.copyTo(backupFile, overwrite = true)
             }
         } catch (e: Exception) {
-            return@withContext Result.failure(Exception("Failed to backup existing component: ${e.message}"))
+            return@withContext Result.failure(Exception("Backup failed: ${e.message}"))
         }
 
-        // Step 2: Delete old file and download new version
+        // Download new version
         try {
-            if (targetFile.exists()) {
-                if (targetFile.isDirectory) targetFile.deleteRecursively() else targetFile.delete()
-            }
-
-            val result = downloadManager.downloadComponent(updated, onProgress)
-            result.getOrThrow()
-
-            // Step 3: Success — save the installed version and remove backup
+            if (targetFile.exists()) targetFile.delete()
+            downloadManager.downloadComponent(updated, onProgress).getOrThrow()
             registry.saveInstalledVersion(updateInfo.componentId, updated.version)
-            if (backupFile.exists()) {
-                if (backupFile.isDirectory) backupFile.deleteRecursively() else backupFile.delete()
-            }
-
+            backupFile.delete()
             Result.success(Unit)
         } catch (e: Exception) {
-            // Step 4: Rollback — restore the backup
+            // Rollback
             try {
-                if (targetFile.exists()) {
-                    if (targetFile.isDirectory) targetFile.deleteRecursively() else targetFile.delete()
-                }
-                if (backupFile.exists()) {
-                    backupFile.renameTo(targetFile)
-                }
-            } catch (_: Exception) {
-                // Rollback itself failed — component may be in broken state
-            }
-            Result.failure(Exception("Update failed (rolled back): ${e.message}"))
+                if (targetFile.exists()) targetFile.delete()
+                if (backupFile.exists()) backupFile.renameTo(targetFile)
+            } catch (_: Exception) {}
+            Result.failure(Exception("Download failed, rolled back: ${e.message}"))
         }
     }
 
     /**
-     * Apply all available updates sequentially with rollback per-component.
+     * Apply all available updates. Each update is independent — one failure
+     * does not prevent others from being applied.
      */
     suspend fun applyAllUpdates(
         updates: List<UpdateInfo>,
         onComponentProgress: (componentId: String, progress: Float) -> Unit,
         onComponentComplete: (componentId: String, success: Boolean, error: String?) -> Unit
     ) = withContext(Dispatchers.IO) {
-        for (update in updates.filter { it.hasUpdate }) {
-            val result = applyUpdate(update) { progress ->
-                onComponentProgress(update.componentId, progress)
+        val toUpdate = updates.filter { it.hasUpdate && it.updatedComponent != null }
+        for (update in toUpdate) {
+            try {
+                val result = applyUpdate(update) { progress ->
+                    onComponentProgress(update.componentId, progress)
+                }
+                onComponentComplete(update.componentId, result.isSuccess, result.exceptionOrNull()?.message)
+            } catch (e: Exception) {
+                onComponentComplete(update.componentId, false, e.message)
+                // Continue with next component — don't let one failure block others
             }
-            onComponentComplete(
-                update.componentId,
-                result.isSuccess,
-                result.exceptionOrNull()?.message
-            )
         }
     }
 
     private fun checkComponent(component: ToolchainComponent): UpdateInfo {
-        // Use the *installed* version, not the registry's hardcoded version
         val installedVersion = registry.getInstalledVersion(component.id) ?: component.version
 
         val latestVersion = try {
-            when {
-                component.sources.any { it.mirror == "maven_central" } ->
-                    checkMavenCentral(component)
-                component.sources.any { it.mirror == "google_maven" } ->
-                    checkGoogleMaven(component)
-                component.sources.any { it.mirror == "github" } ->
-                    checkGitHub(component)
+            when (component.id) {
+                "ecj" -> checkMavenCentral("org.eclipse.jdt", "ecj")
+                "kotlinc" -> checkMavenCentral("org.jetbrains.kotlin", "kotlin-compiler-embeddable")
+                "kotlin-stdlib" -> checkMavenCentral("org.jetbrains.kotlin", "kotlin-stdlib")
+                "d8" -> checkGoogleMaven("com/android/tools", "r8")
                 else -> null
             }
         } catch (_: Exception) {
@@ -148,17 +179,10 @@ class ComponentUpdateChecker @Inject constructor(
 
         val hasUpdate = latestVersion != null
                 && latestVersion != installedVersion
-                && compareVersions(latestVersion, installedVersion) > 0
+                && isNewerVersion(latestVersion, installedVersion)
 
         val updatedComponent = if (hasUpdate && latestVersion != null) {
-            component.copy(
-                version = latestVersion,
-                sources = component.sources.map { source ->
-                    source.copy(
-                        url = source.url.replace(component.version, latestVersion)
-                    )
-                }
-            )
+            buildUpdatedComponent(component, latestVersion)
         } else null
 
         return UpdateInfo(
@@ -171,21 +195,43 @@ class ComponentUpdateChecker @Inject constructor(
         )
     }
 
-    private fun checkMavenCentral(component: ToolchainComponent): String? {
-        val url = component.sources.first { it.mirror == "maven_central" }.url
-        val parts = url.removePrefix("https://repo1.maven.org/maven2/").split("/")
-        if (parts.size < 3) return null
+    /**
+     * Builds an updated component with correct download URLs for the new version.
+     * Uses explicit URL construction per component instead of fragile string replacement.
+     */
+    private fun buildUpdatedComponent(component: ToolchainComponent, newVersion: String): ToolchainComponent? {
+        val newSources = when (component.id) {
+            "ecj" -> listOf(
+                DownloadSource("https://repo1.maven.org/maven2/org/eclipse/jdt/ecj/$newVersion/ecj-$newVersion.jar", "maven_central", 1)
+            )
+            "kotlinc" -> listOf(
+                DownloadSource("https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-compiler-embeddable/$newVersion/kotlin-compiler-embeddable-$newVersion.jar", "maven_central", 1)
+            )
+            "kotlin-stdlib" -> listOf(
+                DownloadSource("https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/$newVersion/kotlin-stdlib-$newVersion.jar", "maven_central", 1)
+            )
+            "kotlin-script-runtime" -> listOf(
+                DownloadSource("https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-script-runtime/$newVersion/kotlin-script-runtime-$newVersion.jar", "maven_central", 1)
+            )
+            "d8" -> listOf(
+                DownloadSource("https://dl.google.com/android/maven2/com/android/tools/r8/$newVersion/r8-$newVersion.jar", "google_maven", 1)
+            )
+            else -> return null
+        }
 
-        val artifactIndex = parts.indexOfLast { it.contains(".jar") } - 1
-        if (artifactIndex < 1) return null
-        val artifact = parts[artifactIndex - 1]
-        val group = parts.subList(0, artifactIndex - 1).joinToString(".")
+        return component.copy(version = newVersion, sources = newSources)
+    }
 
-        val searchUrl = "https://search.maven.org/solrsearch/select?q=g:\"$group\"+AND+a:\"$artifact\"&rows=1&wt=json"
+    /**
+     * Query Maven Central for the latest version of a specific group:artifact.
+     */
+    private fun checkMavenCentral(group: String, artifact: String): String? {
+        val searchUrl = "https://search.maven.org/solrsearch/select?q=g:%22$group%22+AND+a:%22$artifact%22&rows=1&wt=json"
         val request = Request.Builder().url(searchUrl).build()
         val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return null
+        val body = response.body?.string()
         response.close()
+        if (body == null) return null
 
         return try {
             val json = JSONObject(body)
@@ -194,53 +240,45 @@ class ComponentUpdateChecker @Inject constructor(
         } catch (_: Exception) { null }
     }
 
-    private fun checkGoogleMaven(component: ToolchainComponent): String? {
-        val url = component.sources.first { it.mirror == "google_maven" }.url
-        val parts = url.removePrefix("https://dl.google.com/android/maven2/").split("/")
-        if (parts.size < 3) return null
-
-        val groupPath = parts.dropLast(2).joinToString("/")
-        val metadataUrl = "https://dl.google.com/android/maven2/$groupPath/maven-metadata.xml"
+    /**
+     * Query Google Maven for the latest version via maven-metadata.xml.
+     */
+    private fun checkGoogleMaven(groupPath: String, artifact: String): String? {
+        val metadataUrl = "https://dl.google.com/android/maven2/$groupPath/$artifact/maven-metadata.xml"
         val request = Request.Builder().url(metadataUrl).build()
         val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return null
+        val body = response.body?.string()
         response.close()
+        if (body == null) return null
 
+        // Parse <latest> or last <version> from metadata
         val latestRegex = Regex("<latest>(.+?)</latest>")
-        val versionRegex = Regex("<version>(.+?)</version>")
         latestRegex.find(body)?.groupValues?.get(1)?.let { return it }
-        versionRegex.findAll(body).lastOrNull()?.groupValues?.get(1)?.let { return it }
-        return null
+
+        val versionRegex = Regex("<version>(.+?)</version>")
+        return versionRegex.findAll(body).lastOrNull()?.groupValues?.get(1)
     }
 
-    private fun checkGitHub(component: ToolchainComponent): String? {
-        val url = component.sources.first { it.mirror == "github" }.url
-        val match = Regex("github.com/([^/]+)/([^/]+)").find(url) ?: return null
-        val owner = match.groupValues[1]
-        val repo = match.groupValues[2]
+    /**
+     * Conservative version comparison. Returns true only if both versions
+     * are valid semver-ish and a is clearly newer than b.
+     */
+    private fun isNewerVersion(candidate: String, current: String): Boolean {
+        // Reject versions with non-numeric parts we can't compare
+        val candidateParts = candidate.split(".").mapNotNull { it.toIntOrNull() }
+        val currentParts = current.split(".").mapNotNull { it.toIntOrNull() }
 
-        val apiUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
-        val request = Request.Builder().url(apiUrl)
-            .header("Accept", "application/vnd.github+json")
-            .build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return null
-        response.close()
+        // If either version couldn't be fully parsed, don't report an update
+        if (candidateParts.size < 2 || currentParts.size < 2) return false
+        if (candidateParts.size != candidate.split(".").size) return false
+        if (currentParts.size != current.split(".").size) return false
 
-        return try {
-            JSONObject(body).optString("tag_name")?.removePrefix("v")
-        } catch (_: Exception) { null }
-    }
-
-    private fun compareVersions(a: String, b: String): Int {
-        val partsA = a.split(Regex("[.\\-+]")).map { it.toIntOrNull() ?: 0 }
-        val partsB = b.split(Regex("[.\\-+]")).map { it.toIntOrNull() ?: 0 }
-        val maxLen = maxOf(partsA.size, partsB.size)
+        val maxLen = maxOf(candidateParts.size, currentParts.size)
         for (i in 0 until maxLen) {
-            val va = partsA.getOrElse(i) { 0 }
-            val vb = partsB.getOrElse(i) { 0 }
-            if (va != vb) return va.compareTo(vb)
+            val va = candidateParts.getOrElse(i) { 0 }
+            val vb = currentParts.getOrElse(i) { 0 }
+            if (va != vb) return va > vb
         }
-        return 0
+        return false
     }
 }
