@@ -96,7 +96,7 @@ class ToolchainRegistry @Inject constructor(
             id = "jdk",
             displayName = "OpenJDK 17 (Termux/Bionic)",
             version = "17",
-            sizeBytes = 200_000_000, // ~200MB
+            sizeBytes = 96_680_976, // ~96MB (JDK + native deps)
             type = ComponentType.JDK_ARCHIVE,
             sources = listOf(
                 DownloadSource("termux://openjdk-17", "termux", 1)

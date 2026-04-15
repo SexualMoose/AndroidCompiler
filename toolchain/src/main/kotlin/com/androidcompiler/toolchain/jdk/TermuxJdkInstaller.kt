@@ -52,11 +52,29 @@ class TermuxJdkInstaller @Inject constructor(
     val jdkDir: File get() = File(registry.toolchainDir, "jdk17")
 
     fun isInstalled(): Boolean {
-        val javaBin = File(jdkDir, "bin/java")
-        return javaBin.exists() && javaBin.canExecute()
+        val javaHome = getJavaHome() ?: return false
+        val javaBin = File(javaHome, "bin/java")
+        val libDir = File(javaHome, "lib")
+        // Must have java binary AND lib directory (with modules/libjvm.so)
+        return javaBin.exists() && libDir.exists() && libDir.listFiles()?.isNotEmpty() == true
     }
 
-    fun getJavaHome(): File? = if (isInstalled()) jdkDir else null
+    fun getJavaHome(): File? {
+        // Direct: jdk17/bin/java
+        if (File(jdkDir, "bin/java").exists()) return jdkDir
+        // Nested: jdk17/lib/jvm/java-17-openjdk/bin/java
+        val jvmDir = File(jdkDir, "lib/jvm")
+        if (jvmDir.exists()) {
+            jvmDir.listFiles()?.forEach { child ->
+                if (File(child, "bin/java").exists()) return child
+            }
+        }
+        // Single subdirectory
+        jdkDir.listFiles()?.filter { it.isDirectory }?.forEach { child ->
+            if (File(child, "bin/java").exists()) return child
+        }
+        return null
+    }
 
     /**
      * Download and install JDK from Termux repo.
@@ -219,13 +237,14 @@ class TermuxJdkInstaller @Inject constructor(
     }
 
     private fun getFallbackPackages(): List<PackageInfo> {
-        // These are stable Termux package URLs that are unlikely to change quickly
         return listOf(
-            PackageInfo(
-                "openjdk-17",
-                "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_17.0.13-1_aarch64.deb",
-                200_000_000, emptyList()
-            )
+            PackageInfo("openjdk-17", "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb", 95_507_372, emptyList()),
+            PackageInfo("libandroid-shmem", "$TERMUX_REPO/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb", 7_216, emptyList()),
+            PackageInfo("libandroid-spawn", "$TERMUX_REPO/pool/main/liba/libandroid-spawn/libandroid-spawn_0.3_aarch64.deb", 15_216, emptyList()),
+            PackageInfo("libiconv", "$TERMUX_REPO/pool/main/libi/libiconv/libiconv_1.18-1_aarch64.deb", 561_152, emptyList()),
+            PackageInfo("libjpeg-turbo", "$TERMUX_REPO/pool/main/libj/libjpeg-turbo/libjpeg-turbo_3.1.4.1_aarch64.deb", 384_504, emptyList()),
+            PackageInfo("littlecms", "$TERMUX_REPO/pool/main/l/littlecms/littlecms_2.18_aarch64.deb", 142_676, emptyList()),
+            PackageInfo("zlib", "$TERMUX_REPO/pool/main/z/zlib/zlib_1.3.2_aarch64.deb", 62_840, emptyList()),
         )
     }
 
@@ -366,21 +385,21 @@ class TermuxJdkInstaller @Inject constructor(
     }
 
     private fun setExecutePermissions(dir: File) {
-        // bin/ — all files executable
-        File(dir, "bin").listFiles()?.forEach { file ->
-            if (file.isFile) file.setExecutable(true, false)
-        }
-        // lib/ — .so files executable
-        File(dir, "lib").let { libDir ->
-            if (libDir.exists()) {
-                libDir.walkTopDown().filter {
-                    it.isFile && (it.extension == "so" || it.name.startsWith("lib"))
-                }.forEach { it.setExecutable(true, false) }
+        // Recursively find and chmod ALL bin/ directories and .so files
+        dir.walkTopDown().forEach { file ->
+            if (file.isFile) {
+                val shouldBeExec = when {
+                    file.parentFile?.name == "bin" -> true
+                    file.extension == "so" -> true
+                    file.name.startsWith("lib") && file.parentFile?.name == "lib" -> true
+                    file.name == "java" || file.name == "javac" -> true
+                    else -> false
+                }
+                if (shouldBeExec) {
+                    file.setExecutable(true, false)
+                    file.setReadable(true, false)
+                }
             }
-        }
-        // lib/jvm/ — JDK nested inside
-        dir.walkTopDown().filter { it.name == "java" && it.parentFile?.name == "bin" }.forEach {
-            it.setExecutable(true, false)
         }
     }
 
