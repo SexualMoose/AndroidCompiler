@@ -128,13 +128,18 @@ class TermuxJdkInstaller @Inject constructor(
             onLog("Setting permissions...")
             setExecutePermissions(jdkDir)
 
-            // Verify
-            val javaBin = File(jdkDir, "bin/java")
-            if (!javaBin.exists()) {
-                return@withContext Result.failure(Exception("Installation completed but bin/java not found"))
+            // Verify — find java binary in the extracted tree
+            val javaHome = getJavaHome()
+            val javaBin = javaHome?.let { File(it, "bin/java") }
+            if (javaBin == null || !javaBin.exists()) {
+                return@withContext Result.failure(
+                    Exception("Installation completed but java binary not found. " +
+                        "Searched in: ${jdkDir.absolutePath}")
+                )
             }
+            javaBin.setExecutable(true, false)
 
-            onLog("JDK installed: ${jdkDir.absolutePath}")
+            onLog("JDK installed: ${javaHome.absolutePath}")
             registry.saveInstalledVersion("jdk", "17")
             Result.success(jdkDir)
         } catch (e: Exception) {
@@ -245,6 +250,7 @@ class TermuxJdkInstaller @Inject constructor(
             PackageInfo("libjpeg-turbo", "$TERMUX_REPO/pool/main/libj/libjpeg-turbo/libjpeg-turbo_3.1.4.1_aarch64.deb", 384_504, emptyList()),
             PackageInfo("littlecms", "$TERMUX_REPO/pool/main/l/littlecms/littlecms_2.18_aarch64.deb", 142_676, emptyList()),
             PackageInfo("zlib", "$TERMUX_REPO/pool/main/z/zlib/zlib_1.3.2_aarch64.deb", 62_840, emptyList()),
+            PackageInfo("libc++", "$TERMUX_REPO/pool/main/libc/libc++/libc++_29_aarch64.deb", 334_828, emptyList()),
         )
     }
 
@@ -355,23 +361,36 @@ class TermuxJdkInstaller @Inject constructor(
             when (typeFlag.toInt().toChar()) {
                 '5', 'D' -> outFile.mkdirs()
                 '0', '\u0000' -> {
+                    // Regular file
                     outFile.parentFile?.mkdirs()
-                    FileOutputStream(outFile).use { out ->
-                        copyBytes(input, out, size)
+                    // If path exists as directory, remove it first
+                    if (outFile.exists() && outFile.isDirectory) {
+                        outFile.deleteRecursively()
+                    }
+                    try {
+                        FileOutputStream(outFile).use { out ->
+                            copyBytes(input, out, size)
+                        }
+                    } catch (e: Exception) {
+                        // Skip files that can't be written (EISDIR, permission, etc)
+                        skipBytes(input, size - size) // data already consumed by copyBytes attempt
                     }
                     val padding = roundUp512(size) - size
                     if (padding > 0) skipBytes(input, padding)
                 }
                 '2' -> {
-                    // Symlink — read link target from header
+                    // Symlink
                     val linkTarget = String(header, 157, 100).trim('\u0000', ' ')
+                    // Remove existing file/dir before creating symlink
+                    if (outFile.exists()) {
+                        if (outFile.isDirectory) outFile.deleteRecursively() else outFile.delete()
+                    }
+                    outFile.parentFile?.mkdirs()
                     try {
                         val osClass = Class.forName("android.system.Os")
                         osClass.getMethod("symlink", String::class.java, String::class.java)
                             .invoke(null, linkTarget, outFile.absolutePath)
-                    } catch (_: Exception) {
-                        // If symlink fails, skip
-                    }
+                    } catch (_: Exception) { }
                     skipTarEntry(input, size)
                 }
                 else -> skipTarEntry(input, size)

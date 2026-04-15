@@ -118,11 +118,20 @@ class GradleCompiler @Inject constructor(
         env["GRADLE_USER_HOME"] = gradleHome.absolutePath
         env["PATH"] = "${javaHome.absolutePath}/bin:/system/bin:/system/xbin:${System.getenv("PATH") ?: ""}"
 
-        // Termux-specific: ensure LD_LIBRARY_PATH includes Termux's libs
-        val termuxLib = File(javaHome, "lib")
-        if (termuxLib.exists()) {
-            env["LD_LIBRARY_PATH"] = "${termuxLib.absolutePath}:${System.getenv("LD_LIBRARY_PATH") ?: ""}"
-        }
+        // LD_LIBRARY_PATH must include BOTH:
+        // - javaHome/lib (JDK's own libs: libjli.so, libjvm.so, etc.)
+        // - jdk17/lib (Termux dependency libs: libz.so, libc++_shared.so, libiconv, etc.)
+        val ldPaths = mutableListOf<String>()
+        val jdkLib = File(javaHome, "lib")
+        if (jdkLib.exists()) ldPaths.add(jdkLib.absolutePath)
+        // The parent "jdk17/lib" has Termux native deps
+        val termuxLibDir = File(jdkInstaller.jdkDir, "lib")
+        if (termuxLibDir.exists()) ldPaths.add(termuxLibDir.absolutePath)
+        // Also add server/client JVM dirs
+        File(jdkLib, "server").let { if (it.exists()) ldPaths.add(it.absolutePath) }
+        File(jdkLib, "client").let { if (it.exists()) ldPaths.add(it.absolutePath) }
+        env["LD_LIBRARY_PATH"] = ldPaths.joinToString(":") +
+            ":${System.getenv("LD_LIBRARY_PATH") ?: ""}"
 
         onLog("Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
 
