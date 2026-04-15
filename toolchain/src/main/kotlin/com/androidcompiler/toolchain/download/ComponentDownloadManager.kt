@@ -5,6 +5,7 @@ import com.androidcompiler.core.common.model.ComponentStatus
 import com.androidcompiler.core.common.model.ComponentType
 import com.androidcompiler.core.common.model.ToolchainComponent
 import com.androidcompiler.network.ChunkedDownloader
+import com.androidcompiler.toolchain.jdk.TermuxJdkInstaller
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -21,7 +22,8 @@ import javax.inject.Singleton
 class ComponentDownloadManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val chunkedDownloader: ChunkedDownloader,
-    private val registry: ToolchainRegistry
+    private val registry: ToolchainRegistry,
+    private val termuxJdkInstaller: TermuxJdkInstaller
 ) {
     suspend fun downloadComponent(
         component: ToolchainComponent,
@@ -38,21 +40,13 @@ class ComponentDownloadManager @Inject constructor(
             try {
                 val downloadFile = when (component.type) {
                     ComponentType.JDK_ARCHIVE -> {
-                        // JDK comes as a tar.gz, download to temp then extract
-                        val tempTgz = File(context.cacheDir, "${component.id}_temp.tar.gz")
-                        val result = chunkedDownloader.download(
-                            url = source.url,
-                            outputFile = tempTgz,
-                            onProgress = { downloaded, total ->
-                                if (total > 0) onProgress(downloaded.toFloat() / total)
-                            }
+                        // Use TermuxJdkInstaller for Bionic-linked JDK
+                        val result = termuxJdkInstaller.install(
+                            onProgress = onProgress,
+                            onLog = { /* logged by caller */ }
                         )
                         result.getOrThrow()
-                        extractTarGz(tempTgz, targetFile)
-                        tempTgz.delete()
-                        // Set all files in bin/ as executable
-                        setJdkPermissions(targetFile)
-                        targetFile
+                        return@withContext Result.success(termuxJdkInstaller.jdkDir)
                     }
                     ComponentType.SDK_PLATFORM -> {
                         // SDK platform comes as a ZIP, download to temp then extract android.jar

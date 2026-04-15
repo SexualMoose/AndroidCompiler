@@ -93,6 +93,18 @@ class ToolchainRegistry @Inject constructor(
             installPath = "r8.jar"
         ),
         ToolchainComponent(
+            id = "jdk",
+            displayName = "OpenJDK 17 (Termux/Bionic)",
+            version = "17",
+            sizeBytes = 200_000_000, // ~200MB
+            type = ComponentType.JDK_ARCHIVE,
+            sources = listOf(
+                DownloadSource("termux://openjdk-17", "termux", 1)
+            ),
+            sha256 = "",
+            installPath = "jdk17"
+        ),
+        ToolchainComponent(
             id = "gradle-wrapper",
             displayName = "Gradle Wrapper",
             version = "8.11.1",
@@ -138,25 +150,32 @@ class ToolchainRegistry @Inject constructor(
     fun isAllInstalled(): Boolean =
         getComponents().all { getComponentStatus(it) is ComponentStatus.Installed }
 
-    fun getJdkDir(): File = File(toolchainDir, "jdk")
+    fun getJdkDir(): File = File(toolchainDir, "jdk17")
 
     /**
      * Returns the JAVA_HOME path for the bundled JDK.
-     * The JDK is extracted as a tar.gz, so there may be a single
-     * subdirectory like jdk-17.0.x+y inside the jdk/ directory.
+     * Checks the Termux-extracted JDK in multiple possible structures.
      */
     fun getJavaHome(): File? {
         val jdkDir = getJdkDir()
         if (!jdkDir.exists()) return null
 
-        // Check if bin/java exists directly
+        // Direct: jdk17/bin/java
         if (File(jdkDir, "bin/java").exists()) return jdkDir
 
-        // Check for a single subdirectory (e.g., jdk-17.0.18+8)
-        val children = jdkDir.listFiles()?.filter { it.isDirectory } ?: return null
-        for (child in children) {
+        // Nested JVM: jdk17/lib/jvm/java-17-openjdk/bin/java
+        val jvmDir = File(jdkDir, "lib/jvm")
+        if (jvmDir.exists()) {
+            jvmDir.listFiles()?.forEach { child ->
+                if (File(child, "bin/java").exists()) return child
+            }
+        }
+
+        // Single subdirectory: jdk17/jdk-17.0.x/bin/java
+        jdkDir.listFiles()?.filter { it.isDirectory }?.forEach { child ->
             if (File(child, "bin/java").exists()) return child
         }
+
         return null
     }
 

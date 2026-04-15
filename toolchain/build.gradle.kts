@@ -13,4 +13,5 @@ dependencies {
     implementation(project(":network"))
     implementation(libs.apksig)
     implementation(libs.okhttp)
+    implementation(libs.xz)
 }

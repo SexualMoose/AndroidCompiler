@@ -17,6 +17,7 @@ lifecycleRuntime = "2.8.7"
 serialization = "1.7.3"
 apksig = "8.7.3"
 documentfile = "1.0.1"
+xz = "1.10"
 
 [libraries]
 # Compose
@@ -56,6 +57,9 @@ apksig = { group = "com.android.tools.build", name = "apksig", version.ref = "ap
 
 # DocumentFile
 documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
+
+# XZ compression (for extracting Termux .deb packages)
+xz = { group = "org.tukaani", name = "xz", version.ref = "xz" }
 
 # Build logic dependencies
 android-gradlePlugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }

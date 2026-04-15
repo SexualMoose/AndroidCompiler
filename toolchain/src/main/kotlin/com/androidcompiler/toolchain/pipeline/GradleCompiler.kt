@@ -3,6 +3,7 @@ package com.androidcompiler.toolchain.pipeline
 import android.content.Context
 import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.ErrorSeverity
+import com.androidcompiler.toolchain.jdk.TermuxJdkInstaller
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -30,7 +31,8 @@ import javax.inject.Singleton
 @Singleton
 class GradleCompiler @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val registry: ToolchainRegistry
+    private val registry: ToolchainRegistry,
+    private val jdkInstaller: TermuxJdkInstaller
 ) {
     companion object {
         private const val GRADLE_WRAPPER_VERSION = "8.11.1"
@@ -55,15 +57,13 @@ class GradleCompiler @Inject constructor(
             onLog("No compatible JDK found on device", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR, buildString {
-                    appendLine("Gradle projects require a full JDK which is not available on stock Android.")
+                    appendLine("Gradle projects require a JDK (OpenJDK 17).")
                     appendLine()
-                    appendLine("To enable Gradle builds, install Termux from F-Droid and run:")
-                    appendLine("  pkg install openjdk-17")
+                    appendLine("Go to the Components tab and download 'OpenJDK 17 (Termux/Bionic)'.")
+                    appendLine("This downloads a ~200MB JDK that runs natively on Android.")
                     appendLine()
-                    appendLine("AndroidCompiler will automatically detect and use Termux's JDK.")
-                    appendLine()
-                    appendLine("For simple projects without external dependencies (no Hilt, Compose BOM,")
-                    appendLine("CameraX, etc.), AndroidCompiler's built-in compiler works without Termux.")
+                    appendLine("For simple projects without external dependencies,")
+                    appendLine("the built-in compiler works without the JDK.")
                 })
             ))
         }
@@ -153,13 +153,15 @@ class GradleCompiler @Inject constructor(
     }
 
     private fun findJavaHome(): File? {
-        // Termux JDK — the only JDK that works on stock Android
+        // Priority 1: Bundled JDK (downloaded from Termux repo by AndroidCompiler)
+        val bundledJdk = jdkInstaller.getJavaHome() ?: registry.getJavaHome()
+        if (bundledJdk != null && File(bundledJdk, "bin/java").exists()) return bundledJdk
+
+        // Priority 2: Termux installed JDK (if user has Termux)
         for (path in TERMUX_JDK_PATHS) {
             val dir = File(path)
             if (File(dir, "bin/java").exists()) return dir
         }
-
-        // Check if Termux has a JDK in a versioned path
         val jvmDir = File("/data/data/com.termux/files/usr/lib/jvm")
         if (jvmDir.exists()) {
             jvmDir.listFiles()?.forEach { child ->
@@ -167,7 +169,7 @@ class GradleCompiler @Inject constructor(
             }
         }
 
-        // Environment variable
+        // Priority 3: Environment variable
         System.getenv("JAVA_HOME")?.let { path ->
             val dir = File(path)
             if (File(dir, "bin/java").exists()) return dir
