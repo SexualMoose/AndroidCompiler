@@ -94,18 +94,25 @@ class GradleCompiler @Inject constructor(
         // Configure for on-device build
         injectGradleProperties(projectDir, onLog)
 
+        // Clean up any stale Gradle init scripts
+        val gradleHomeDir = File(context.filesDir, "gradle_home")
+        File(gradleHomeDir, "init.d/aapt2-env.gradle").let { if (it.exists()) it.delete() }
+
         // Build command via /system/bin/sh — required because /data is noexec.
         // ProcessBuilder can't execute binaries from /data directly, but
         // /system/bin/sh (on exec-mounted /system) CAN exec them.
         val gradleHome = File(context.filesDir, "gradle_home").apply { mkdirs() }
 
-        // Build LD_LIBRARY_PATH
+        // Build LD_LIBRARY_PATH — include JDK libs AND AAPT2 prefix libs
         val ldPaths = mutableListOf<String>()
         val jdkLib = File(javaHome, "lib")
         if (jdkLib.exists()) ldPaths.add(jdkLib.absolutePath)
         val termuxLibDir = File(jdkInstaller.jdkDir, "lib")
         if (termuxLibDir.exists()) ldPaths.add(termuxLibDir.absolutePath)
         File(jdkLib, "server").let { if (it.exists()) ldPaths.add(it.absolutePath) }
+        // AAPT2's shared library dependencies (libprotobuf, libexpat, etc.)
+        val aapt2LibDir = registry.getAapt2LibDir()
+        if (aapt2LibDir.exists()) ldPaths.add(aapt2LibDir.absolutePath)
         val ldPath = ldPaths.joinToString(":")
 
         // Temp dir — the Termux JDK defaults to /data/data/com.termux/files/usr/tmp
@@ -117,8 +124,36 @@ class GradleCompiler @Inject constructor(
         val userHome = File(context.filesDir, "home").apply { mkdirs() }
         File(userHome, ".android").mkdirs()
 
+        // Pre-build verification: check AAPT2 can find its shared libraries
+        val aapt2Bin = registry.getAapt2Binary()
+        if (aapt2Bin.exists()) {
+            onLog("AAPT2: ${aapt2Bin.absolutePath}", ErrorSeverity.INFO)
+            // Ensure shared libs from JDK are available in aapt2-prefix/lib.
+            // AAPT2 depends on libc++_shared.so, libz.so.1, etc. which come from
+            // Termux's JDK dependencies but aren't in the AAPT2 packages.
+            val jdkLibSrc = File(jdkInstaller.jdkDir, "lib")
+            if (jdkLibSrc.exists() && aapt2LibDir.exists()) {
+                val neededLibs = listOf("libc++_shared.so", "libz.so", "libz.so.1", "libz.so.1.3.2")
+                for (libName in neededLibs) {
+                    val dest = File(aapt2LibDir, libName)
+                    if (!dest.exists()) {
+                        val src = File(jdkLibSrc, libName)
+                        if (src.exists()) {
+                            try { src.copyTo(dest); dest.setExecutable(true, false) }
+                            catch (_: Exception) { }
+                        }
+                    }
+                }
+                onLog("Ensured AAPT2 shared library dependencies", ErrorSeverity.INFO)
+            }
+            val soFiles = aapt2LibDir.listFiles()?.filter { ".so" in it.name }?.size ?: 0
+            onLog("AAPT2 libs: $soFiles .so files in ${aapt2LibDir.absolutePath}", ErrorSeverity.INFO)
+        }
+
         // Build the full shell command with env vars inline
         val shellCmd = buildString {
+            // Raise file descriptor limit — AAPT2 daemon keeps many files open
+            append("ulimit -n 65535 2>/dev/null; ")
             append("export JAVA_HOME='${javaHome.absolutePath}' && ")
             append("export ANDROID_HOME='${androidSdk?.absolutePath ?: ""}' && ")
             append("export ANDROID_SDK_ROOT='${androidSdk?.absolutePath ?: ""}' && ")
@@ -146,7 +181,36 @@ class GradleCompiler @Inject constructor(
             append("assembleDebug ")
             append("--no-daemon ")
             append("--console=plain ")
-            append("--warning-mode=all")
+            append("--warning-mode=all ")
+            append("--stacktrace")
+        }
+
+        // Create a wrapper script for AAPT2 that sets LD_LIBRARY_PATH.
+        // The Termux AAPT2 binary has a hardcoded RPATH pointing to
+        // /data/data/com.termux/files/usr/lib (which doesn't exist), so
+        // LD_LIBRARY_PATH is required. However, AGP starts AAPT2 daemon
+        // via ProcessBuilder and LD_LIBRARY_PATH may not propagate on
+        // Android's linker namespace system. The wrapper ensures it's set.
+        val aapt2Wrapper = File(aapt2Bin.parentFile, "aapt2-wrapper")
+        if (aapt2Bin.exists()) {
+            val realBin = File(aapt2Bin.parentFile, "aapt2-real")
+            if (!realBin.exists()) {
+                // First time: rename original binary to aapt2-real
+                aapt2Bin.renameTo(realBin)
+            }
+            // (Re)write the wrapper script — it sets LD_LIBRARY_PATH then exec's the real binary
+            // Also logs invocations for debugging
+            val logFile = File(context.filesDir, "aapt2_wrapper.log")
+            aapt2Bin.writeText("""#!/system/bin/sh
+echo "AAPT2 wrapper invoked: ${'$'}@" >> '${logFile.absolutePath}'
+echo "LD_LIBRARY_PATH before: ${'$'}LD_LIBRARY_PATH" >> '${logFile.absolutePath}'
+export LD_LIBRARY_PATH='${aapt2LibDir.absolutePath}:${File(jdkInstaller.jdkDir, "lib").absolutePath}:${File(javaHome, "lib").absolutePath}'
+echo "LD_LIBRARY_PATH after: ${'$'}LD_LIBRARY_PATH" >> '${logFile.absolutePath}'
+exec '${realBin.absolutePath}' "${'$'}@"
+""")
+            aapt2Bin.setExecutable(true, false)
+            aapt2Bin.setReadable(true, false)
+            onLog("AAPT2 wrapper created with LD_LIBRARY_PATH", ErrorSeverity.INFO)
         }
 
         // Execute via /system/bin/sh which is on an exec-mounted partition.
@@ -158,6 +222,13 @@ class GradleCompiler @Inject constructor(
         onLog("LD_LIBRARY_PATH: $ldPath", ErrorSeverity.INFO)
 
         val result = executeGradleBuild(command, projectDir, onLog)
+
+        // Write full build output to persistent location for debugging
+        try {
+            File(context.filesDir, "gradle_build_output.txt").writeText(
+                "=== STDOUT ===\n${result.stdout}\n=== STDERR ===\n${result.stderr}\n=== EXIT: ${result.exitCode} ===\n"
+            )
+        } catch (_: Exception) { }
 
         if (result.exitCode != 0) {
             val allOutput = result.stderr + "\n" + result.stdout
@@ -222,15 +293,95 @@ class GradleCompiler @Inject constructor(
         val androidJar = registry.getAndroidJar()
         if (androidJar.exists()) {
             val sdkRoot = File(context.filesDir, "android-sdk")
-            // Create platform dirs for multiple possible names AGP might look for
-            // (e.g., android-35, android-35-2, android-35-ext14)
-            for (suffix in listOf("android-35", "android-35-2", "android-35-ext14")) {
+            // Remove any stale build-tools stub that would cause AGP to report "corrupted"
+            File(sdkRoot, "build-tools").let { if (it.exists()) it.deleteRecursively() }
+            // Create platform dirs for multiple possible names AGP might look for.
+            // Provide both API 34 and 35 platform dirs (our android.jar is API 34
+            // which AAPT2 v2.19 can parse; API 35's resources.arsc uses a newer format).
+            for (suffix in listOf("android-34", "android-34-ext7", "android-35", "android-35-2", "android-35-ext14")) {
                 val platformDir = File(sdkRoot, "platforms/$suffix")
                 platformDir.mkdirs()
                 val targetJar = File(platformDir, "android.jar")
                 if (!targetJar.exists() || targetJar.length() != androidJar.length()) {
                     androidJar.copyTo(targetJar, overwrite = true)
                 }
+                // Ensure android.jar is readable by all (AAPT2 daemon runs as same user
+                // but explicit perms avoid SELinux surprises)
+                targetJar.setReadable(true, false)
+                targetJar.setWritable(false, false)
+                // core-for-system-modules.jar — needed by AGP for Java compilation.
+                // Extracted alongside android.jar from the platform ZIP.
+                val cfsm = File(platformDir, "core-for-system-modules.jar")
+                val cfsmSource = File(registry.toolchainDir, "core-for-system-modules.jar")
+                if (cfsmSource.exists() && (!cfsm.exists() || cfsm.length() != cfsmSource.length())) {
+                    cfsmSource.copyTo(cfsm, overwrite = true)
+                } else if (!cfsm.exists()) {
+                    // Fallback: empty JAR if not extracted from platform ZIP
+                    cfsm.writeBytes(createEmptyJar())
+                }
+                // framework.aidl — needed by AGP for AIDL compilation
+                val fwAidl = File(platformDir, "framework.aidl")
+                if (!fwAidl.exists()) fwAidl.writeText("// stub\n")
+                // AGP also looks for build.prop and source.properties — create stubs
+                File(platformDir, "build.prop").apply {
+                    if (!exists()) writeText(
+                        "ro.build.version.sdk=35\n" +
+                        "ro.build.version.codename=REL\n"
+                    )
+                }
+                File(platformDir, "source.properties").apply {
+                    if (!exists()) writeText(
+                        "Pkg.Desc=Android SDK Platform 35\n" +
+                        "Pkg.Revision=1\n" +
+                        "AndroidVersion.ApiLevel=35\n" +
+                        "Layoutlib.Api=15\n" +
+                        "Layoutlib.Revision=1\n"
+                    )
+                }
+            }
+            // Create build-tools with our ARM64 AAPT2 wrapper.
+            // AGP validates build-tools by checking for aapt, aapt2, dx, and other tools.
+            // We provide our wrapper for aapt2 and stub scripts for tools AGP checks but
+            // doesn't actually invoke during modern builds.
+            val aapt2Src = registry.getAapt2Binary()
+            if (aapt2Src.exists()) {
+                val btDir = File(sdkRoot, "build-tools/35.0.0")
+                btDir.mkdirs()
+                File(btDir, "source.properties").writeText(
+                    "Pkg.Revision=35.0.0\nPkg.Desc=Android SDK Build-Tools 35\n"
+                )
+                // AAPT2 — our wrapper with LD_LIBRARY_PATH
+                val btAapt2 = File(btDir, "aapt2")
+                aapt2Src.copyTo(btAapt2, overwrite = true)
+                btAapt2.setExecutable(true, false)
+                // Copy the real binary too if wrapper references it
+                val realBin = File(aapt2Src.parentFile, "aapt2-real")
+                if (realBin.exists()) {
+                    val btReal = File(btDir, "aapt2-real")
+                    if (!btReal.exists()) realBin.copyTo(btReal)
+                    btReal.setExecutable(true, false)
+                }
+                // Stub scripts for tools that AGP checks but doesn't run in modern builds
+                for (tool in listOf("aapt", "aidl", "dx", "dexdump", "split-select",
+                    "llvm-rs-cc", "zipalign", "apksigner", "mainDexClasses")) {
+                    val stub = File(btDir, tool)
+                    if (!stub.exists()) {
+                        stub.writeText("#!/system/bin/sh\necho 'stub: $tool not available on-device'\nexit 1\n")
+                        stub.setExecutable(true, false)
+                    }
+                }
+                // Empty JAR stubs for build-tools validation
+                // AGP checks these exist but uses its own bundled versions at runtime
+                val emptyJarBytes = createEmptyJar()
+                for (jar in listOf("core-lambda-stubs.jar", "d8.jar",
+                    "lib/dx.jar", "lib/shrinkedAndroid.jar")) {
+                    val f = File(btDir, jar)
+                    f.parentFile?.mkdirs()
+                    if (!f.exists()) f.writeBytes(emptyJarBytes)
+                }
+                // renderscript/ directory that some AGP versions check
+                File(btDir, "renderscript/lib").mkdirs()
+                File(btDir, "renderscript/include").mkdirs()
             }
             // Pre-accept SDK licenses so AGP doesn't reject the synthetic SDK
             val licensesDir = File(sdkRoot, "licenses").apply { mkdirs() }
@@ -272,6 +423,9 @@ class GradleCompiler @Inject constructor(
             appendLine("org.gradle.configuration-cache=false")
             appendLine("org.gradle.parallel=true")
             appendLine("android.useAndroidX=true")
+            // Prevent AGP from downloading x86_64 build-tools over our ARM64 ones
+            appendLine("android.builder.sdkDownload=false")
+            appendLine("android.suppressUnsupportedCompileSdk=35")
             // CRITICAL: These JVM args MUST match what we pass on the java command line
             // in GradleCompiler.compile(). If they differ, Gradle forks a daemon process.
             // -Djdk.lang.Process.launchMechanism=FORK is required because Android's bionic
@@ -366,6 +520,9 @@ zipStorePath=wrapper/dists
                                 line.startsWith("w:") -> onLog(line, ErrorSeverity.WARNING)
                                 line.contains("Downloading") -> onLog(line, ErrorSeverity.INFO)
                                 line.contains("FAILURE") -> onLog(line, ErrorSeverity.ERROR)
+                                line.contains("AAPT") -> onLog(line, ErrorSeverity.ERROR)
+                                line.contains("aapt2") -> onLog(line, ErrorSeverity.WARNING)
+                                line.contains("failed to load") -> onLog(line, ErrorSeverity.ERROR)
                                 line.startsWith("> ") -> onLog(line, ErrorSeverity.INFO)
                             }
                         }
@@ -412,6 +569,15 @@ zipStorePath=wrapper/dists
         return projectDir.walkTopDown()
             .filter { it.extension == "apk" && it.path.contains("outputs") && !it.name.contains("unsigned") }
             .maxByOrNull { it.lastModified() }
+    }
+
+    /** Creates a minimal valid JAR file (just the manifest) */
+    private fun createEmptyJar(): ByteArray {
+        val baos = java.io.ByteArrayOutputStream()
+        java.util.jar.JarOutputStream(baos).use { jos ->
+            // JarOutputStream automatically adds a MANIFEST.MF entry
+        }
+        return baos.toByteArray()
     }
 
     private fun parseGradleErrors(output: String): List<CompilationError> {

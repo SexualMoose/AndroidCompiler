@@ -78,7 +78,9 @@ class ToolchainRegistry @Inject constructor(
                 DownloadSource("termux://aapt2", "termux", 1)
             ),
             sha256 = "",
-            installPath = "aapt2"
+            // Placed in aapt2-prefix/bin/ to match Termux's directory layout.
+            // AAPT2's ELF RPATH is $ORIGIN/../lib, so aapt2-prefix/lib/ is found automatically.
+            installPath = "aapt2-prefix/bin/aapt2"
         ),
         ToolchainComponent(
             id = "d8",
@@ -120,12 +122,15 @@ class ToolchainRegistry @Inject constructor(
         ),
         ToolchainComponent(
             id = "android-jar",
-            displayName = "Android SDK Platform (API 35)",
-            version = "35",
-            sizeBytes = 36_700_160,
+            displayName = "Android SDK Platform (API 34)",
+            version = "34",
+            sizeBytes = 35_651_584,
             type = ComponentType.SDK_PLATFORM,
             sources = listOf(
-                DownloadSource("https://dl.google.com/android/repository/platform-35_r01.zip", "google", 1)
+                // API 34 — compatible with AAPT2 v2.19 (API 35's resources.arsc uses
+                // a newer format that AAPT2 v2.19 can't parse: "illegal map type 'string' (22)")
+                DownloadSource("https://dl.google.com/android/repository/platform-34-ext7_r02.zip", "google", 1),
+                DownloadSource("https://dl.google.com/android/repository/platform-34_r03.zip", "google", 2)
             ),
             sha256 = "",
             installPath = "android.jar"
@@ -211,7 +216,8 @@ class ToolchainRegistry @Inject constructor(
     fun getKotlincJar(): File = File(toolchainDir, "kotlin-compiler-embeddable.jar")
     fun getKotlinStdlibJar(): File = File(toolchainDir, "kotlin-stdlib.jar")
     fun getKotlinScriptRuntimeJar(): File = File(toolchainDir, "kotlin-script-runtime.jar")
-    fun getAapt2Binary(): File = File(toolchainDir, "aapt2")
+    fun getAapt2Binary(): File = File(toolchainDir, "aapt2-prefix/bin/aapt2")
+    fun getAapt2LibDir(): File = File(toolchainDir, "aapt2-prefix/lib")
     fun getR8Jar(): File = File(toolchainDir, "r8.jar")
     fun getAndroidJar(): File = File(toolchainDir, "android.jar")
 }

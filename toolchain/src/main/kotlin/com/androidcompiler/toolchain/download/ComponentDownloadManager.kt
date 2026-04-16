@@ -123,7 +123,14 @@ class ComponentDownloadManager @Inject constructor(
 
     /**
      * Downloads Termux ARM64 AAPT2 binary and its shared library dependencies.
-     * Extracts the aapt2 binary to [targetFile] and .so deps to jdk17/lib.
+     *
+     * Installs into a Termux-like prefix directory:
+     *   toolchain/aapt2-prefix/bin/aapt2   (binary)
+     *   toolchain/aapt2-prefix/lib/         (shared libs)
+     *
+     * This layout matches the AAPT2 binary's ELF RPATH ($ORIGIN/../lib),
+     * so shared libraries are found automatically without LD_LIBRARY_PATH.
+     * We still set LD_LIBRARY_PATH as a fallback for robustness.
      */
     private suspend fun installTermuxAapt2(targetFile: File, onProgress: (Float) -> Unit) {
         val repo = "https://packages.termux.dev/apt/termux-main"
@@ -138,9 +145,10 @@ class ComponentDownloadManager @Inject constructor(
             "$repo/pool/main/libz/libzopfli/libzopfli_1.0.3-5_aarch64.deb",
         )
 
-        // Lib dir where .so files go (same as JDK native libs so they're on LD_LIBRARY_PATH)
-        val libDir = File(registry.getJdkDir(), "lib")
+        // Lib dir in the AAPT2 prefix — matches RPATH ($ORIGIN/../lib from bin/)
+        val libDir = registry.getAapt2LibDir()
         libDir.mkdirs()
+        targetFile.parentFile?.mkdirs()
 
         val total = packages.size
         for ((index, url) in packages.withIndex()) {
@@ -163,6 +171,22 @@ class ComponentDownloadManager @Inject constructor(
 
         targetFile.setExecutable(true, false)
         targetFile.setReadable(true, false)
+
+        // Copy libc++_shared.so from JDK — AAPT2 needs it but it's not in its own packages.
+        // The JDK installer downloads it as part of the libc++ Termux package.
+        val jdkLibDir = File(registry.getJdkDir(), "lib")
+        val libcpp = File(jdkLibDir, "libc++_shared.so")
+        if (libcpp.exists()) {
+            val destLibcpp = File(libDir, "libc++_shared.so")
+            if (!destLibcpp.exists()) {
+                libcpp.copyTo(destLibcpp)
+                destLibcpp.setExecutable(true, false)
+                destLibcpp.setReadable(true, false)
+            }
+        }
+
+        // Verify symlinks and fix any that are broken
+        fixBrokenSymlinks(libDir)
     }
 
     /**
@@ -280,20 +304,90 @@ class ComponentDownloadManager @Inject constructor(
                 }
                 '2' -> {
                     // Symlink — create for versioned .so files (e.g., libexpat.so.1 -> libexpat.so.1.11.3)
-                    val linkTarget = String(header, 157, 100).trim('\u0000', ' ')
+                    val rawLinkTarget = String(header, 157, 100).trim('\u0000', ' ')
                     val fileName = File(fullName).name
                     if (".so" in fileName && fullName.startsWith("lib/")) {
                         val outFile = File(libDir, fileName)
+                        // Strip any path from link target — use just the basename.
+                        // Termux TAR may store targets as relative paths like
+                        // "libexpat.so.1.11.3" or absolute Termux paths. We only
+                        // need the filename since source and target are in the same dir.
+                        val linkTargetName = File(rawLinkTarget).name
                         if (outFile.exists()) outFile.delete()
                         try {
                             val osClass = Class.forName("android.system.Os")
                             osClass.getMethod("symlink", String::class.java, String::class.java)
-                                .invoke(null, linkTarget, outFile.absolutePath)
-                        } catch (_: Exception) { }
+                                .invoke(null, linkTargetName, outFile.absolutePath)
+                        } catch (_: Exception) {
+                            // Fallback: copy the target file if symlink creation fails
+                            val targetFile = File(libDir, linkTargetName)
+                            if (targetFile.exists() && !outFile.exists()) {
+                                try {
+                                    targetFile.copyTo(outFile)
+                                    outFile.setExecutable(true, false)
+                                } catch (_: Exception) { }
+                            }
+                        }
                     }
                     skipBytes(input, roundUp512(size))
                 }
                 else -> skipBytes(input, roundUp512(size))
+            }
+        }
+    }
+
+    /**
+     * Scans [libDir] for broken symlinks and replaces them with copies of
+     * the target file. Also ensures all .so files have execute permission.
+     */
+    private fun fixBrokenSymlinks(libDir: File) {
+        val files = libDir.listFiles() ?: return
+        for (file in files) {
+            try {
+                // Check if this is a symlink
+                val osClass = Class.forName("android.system.Os")
+                val lstatMethod = osClass.getMethod("lstat", String::class.java)
+                val stat = lstatMethod.invoke(null, file.absolutePath)
+                val modeField = stat.javaClass.getField("st_mode")
+                val mode = modeField.getInt(stat)
+                val S_IFLNK = 0xA000
+                val isSymlink = (mode and 0xF000) == S_IFLNK
+
+                if (isSymlink) {
+                    val readlinkMethod = osClass.getMethod("readlink", String::class.java)
+                    val target = readlinkMethod.invoke(null, file.absolutePath) as String
+
+                    // Resolve the target relative to the symlink's directory
+                    val resolvedTarget = if (File(target).isAbsolute) {
+                        File(target)
+                    } else {
+                        File(file.parentFile, target)
+                    }
+
+                    if (!resolvedTarget.exists()) {
+                        // Broken symlink — try to find the target by name in the same dir
+                        val targetName = File(target).name
+                        val localTarget = File(libDir, targetName)
+                        file.delete()
+                        if (localTarget.exists()) {
+                            // Re-create symlink with just the filename
+                            try {
+                                osClass.getMethod("symlink", String::class.java, String::class.java)
+                                    .invoke(null, targetName, file.absolutePath)
+                            } catch (_: Exception) {
+                                // Last resort: copy the file
+                                localTarget.copyTo(file)
+                                file.setExecutable(true, false)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // If we can't check symlinks, just ensure permissions
+            }
+            if (file.exists()) {
+                file.setExecutable(true, false)
+                file.setReadable(true, false)
             }
         }
     }
@@ -311,20 +405,27 @@ class ComponentDownloadManager @Inject constructor(
     }
 
     private fun extractAndroidJar(zipFile: File, targetFile: File) {
+        // Extract android.jar and core-for-system-modules.jar from the platform ZIP
+        val coreModulesTarget = File(targetFile.parentFile, "core-for-system-modules.jar")
+        var foundAndroidJar = false
+
         ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
-                if (entry.name.endsWith("android.jar")) {
-                    targetFile.outputStream().use { out ->
-                        zis.copyTo(out)
+                when {
+                    entry.name.endsWith("android.jar") -> {
+                        targetFile.outputStream().use { out -> zis.copyTo(out) }
+                        foundAndroidJar = true
                     }
-                    return
+                    entry.name.endsWith("core-for-system-modules.jar") -> {
+                        coreModulesTarget.outputStream().use { out -> zis.copyTo(out) }
+                    }
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry
             }
         }
-        throw Exception("android.jar not found in SDK platform ZIP")
+        if (!foundAndroidJar) throw Exception("android.jar not found in SDK platform ZIP")
     }
 
     private fun extractAapt2FromJar(jarFile: File, targetFile: File) {
