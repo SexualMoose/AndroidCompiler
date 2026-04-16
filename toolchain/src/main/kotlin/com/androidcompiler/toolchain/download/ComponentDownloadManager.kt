@@ -10,9 +10,11 @@ import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
 import javax.inject.Inject
@@ -64,8 +66,11 @@ class ComponentDownloadManager @Inject constructor(
                         targetFile
                     }
                     ComponentType.NATIVE_BINARY -> {
-                        // AAPT2 from Google Maven comes as a JAR containing the binary
-                        if (source.url.endsWith(".jar") && component.id == "aapt2") {
+                        if (source.url.startsWith("termux://") && component.id == "aapt2") {
+                            // Download ARM64 AAPT2 + deps from Termux repo
+                            installTermuxAapt2(targetFile, onProgress)
+                            targetFile
+                        } else if (source.url.endsWith(".jar") && component.id == "aapt2") {
                             val tempJar = File(context.cacheDir, "${component.id}_temp.jar")
                             val result = chunkedDownloader.download(
                                 url = source.url,
@@ -114,6 +119,179 @@ class ComponentDownloadManager @Inject constructor(
         }
 
         Result.failure(lastError ?: Exception("No download sources available for ${component.displayName}"))
+    }
+
+    /**
+     * Downloads Termux ARM64 AAPT2 binary and its shared library dependencies.
+     * Extracts the aapt2 binary to [targetFile] and .so deps to jdk17/lib.
+     */
+    private suspend fun installTermuxAapt2(targetFile: File, onProgress: (Float) -> Unit) {
+        val repo = "https://packages.termux.dev/apt/termux-main"
+        val packages = listOf(
+            "$repo/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
+            "$repo/pool/main/a/aapt/aapt_13.0.0.6-23_aarch64.deb",
+            "$repo/pool/main/a/abseil-cpp/abseil-cpp_20250814.1_aarch64.deb",
+            "$repo/pool/main/libp/libprotobuf/libprotobuf_2%3A33.1-1_aarch64.deb",
+            "$repo/pool/main/f/fmt/fmt_1%3A11.2.0_aarch64.deb",
+            "$repo/pool/main/libe/libexpat/libexpat_2.7.5_aarch64.deb",
+            "$repo/pool/main/libp/libpng/libpng_1.6.57_aarch64.deb",
+            "$repo/pool/main/libz/libzopfli/libzopfli_1.0.3-5_aarch64.deb",
+        )
+
+        // Lib dir where .so files go (same as JDK native libs so they're on LD_LIBRARY_PATH)
+        val libDir = File(registry.getJdkDir(), "lib")
+        libDir.mkdirs()
+
+        val total = packages.size
+        for ((index, url) in packages.withIndex()) {
+            val debFile = File(context.cacheDir, "aapt2_pkg_$index.deb")
+            try {
+                val result = chunkedDownloader.download(
+                    url = url,
+                    outputFile = debFile,
+                    onProgress = { _, _ ->
+                        onProgress((index.toFloat() + 0.5f) / total)
+                    }
+                )
+                result.getOrThrow()
+                extractDebForAapt2(debFile, targetFile, libDir)
+            } finally {
+                debFile.delete()
+            }
+            onProgress((index + 1).toFloat() / total)
+        }
+
+        targetFile.setExecutable(true, false)
+        targetFile.setReadable(true, false)
+    }
+
+    /**
+     * Extracts a Termux .deb file, placing the aapt2 binary at [aapt2Target]
+     * and all .so files into [libDir].
+     */
+    private fun extractDebForAapt2(debFile: File, aapt2Target: File, libDir: File) {
+        FileInputStream(debFile).buffered().use { input ->
+            val magic = ByteArray(8)
+            input.read(magic)
+            if (!String(magic).startsWith("!<arch>")) return
+
+            while (input.available() > 0) {
+                val header = ByteArray(60)
+                val read = readFully(input, header)
+                if (read < 60) break
+
+                val name = String(header, 0, 16).trim()
+                val sizeStr = String(header, 48, 10).trim()
+                val size = sizeStr.toLongOrNull() ?: 0
+
+                if (name.startsWith("data.tar")) {
+                    val dataFile = File(context.cacheDir, "aapt2_data.tar.xz")
+                    FileOutputStream(dataFile).use { out ->
+                        copyBytes(input, out, size)
+                    }
+
+                    // Decompress XZ and extract
+                    XZInputStream(BufferedInputStream(FileInputStream(dataFile), 65536)).use { xzInput ->
+                        extractTarForAapt2(xzInput, aapt2Target, libDir)
+                    }
+                    dataFile.delete()
+                    return
+                } else {
+                    skipBytes(input, size)
+                }
+                if (size % 2 != 0L) input.read()
+            }
+        }
+    }
+
+    /**
+     * Extracts TAR entries, placing bin/aapt2 at [aapt2Target] and .so files in [libDir].
+     * Handles GNU TAR long names (type 'L').
+     */
+    private fun extractTarForAapt2(
+        input: java.io.InputStream,
+        aapt2Target: File,
+        libDir: File
+    ) {
+        val header = ByteArray(512)
+        val termuxPrefix = "data/data/com.termux/files/usr"
+        var pendingLongName: String? = null
+
+        while (true) {
+            val headerRead = readFully(input, header)
+            if (headerRead < 512) break
+            if (header.all { it == 0.toByte() }) break
+
+            val rawName = String(header, 0, 100).trim('\u0000', ' ')
+            val sizeOctal = String(header, 124, 12).trim('\u0000', ' ')
+            val size = if (sizeOctal.isNotEmpty()) {
+                try { sizeOctal.toLong(8) } catch (_: Exception) { 0L }
+            } else 0L
+            val typeFlag = header[156]
+
+            // GNU TAR long name
+            if (typeFlag.toInt().toChar() == 'L') {
+                val nameBytes = ByteArray(size.toInt())
+                readFully(input, nameBytes)
+                pendingLongName = String(nameBytes).trim('\u0000')
+                val padding = roundUp512(size) - size
+                if (padding > 0) skipBytes(input, padding)
+                continue
+            }
+
+            var fullName = if (pendingLongName != null) {
+                val n = pendingLongName!!; pendingLongName = null; n
+            } else {
+                val prefix = String(header, 345, 155).trim('\u0000', ' ')
+                if (prefix.isNotEmpty()) "$prefix/$rawName" else rawName
+            }
+
+            fullName = fullName.removePrefix("./")
+            if (fullName.startsWith(termuxPrefix)) {
+                fullName = fullName.removePrefix(termuxPrefix).removePrefix("/")
+            }
+
+            when (typeFlag.toInt().toChar()) {
+                '0', '\u0000' -> {
+                    val fileName = File(fullName).name
+                    when {
+                        fullName == "bin/aapt2" -> {
+                            aapt2Target.parentFile?.mkdirs()
+                            FileOutputStream(aapt2Target).use { out ->
+                                copyBytes(input, out, size)
+                            }
+                            val padding = roundUp512(size) - size
+                            if (padding > 0) skipBytes(input, padding)
+                        }
+                        fileName.endsWith(".so") && fullName.startsWith("lib/") -> {
+                            val outFile = File(libDir, fileName)
+                            FileOutputStream(outFile).use { out ->
+                                copyBytes(input, out, size)
+                            }
+                            outFile.setExecutable(true, false)
+                            val padding = roundUp512(size) - size
+                            if (padding > 0) skipBytes(input, padding)
+                        }
+                        else -> {
+                            skipBytes(input, roundUp512(size))
+                        }
+                    }
+                }
+                else -> skipBytes(input, roundUp512(size))
+            }
+        }
+    }
+
+    private fun copyBytes(input: java.io.InputStream, output: java.io.OutputStream, count: Long) {
+        var remaining = count
+        val buf = ByteArray(8192)
+        while (remaining > 0) {
+            val toRead = minOf(remaining, buf.size.toLong()).toInt()
+            val read = input.read(buf, 0, toRead)
+            if (read <= 0) break
+            output.write(buf, 0, read)
+            remaining -= read
+        }
     }
 
     private fun extractAndroidJar(zipFile: File, targetFile: File) {

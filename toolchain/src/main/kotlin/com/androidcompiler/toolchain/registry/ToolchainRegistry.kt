@@ -70,11 +70,12 @@ class ToolchainRegistry @Inject constructor(
         ToolchainComponent(
             id = "aapt2",
             displayName = "AAPT2 (ARM64)",
-            version = "8.7.3",
-            sizeBytes = 8_388_608,
+            version = "13.0.0.6",
+            sizeBytes = 7_800_000, // ~7.5MB total (aapt2 + aapt + deps)
             type = ComponentType.NATIVE_BINARY,
             sources = listOf(
-                DownloadSource("https://dl.google.com/android/maven2/com/android/tools/build/aapt2/8.7.3-12006047/aapt2-8.7.3-12006047-linux.jar", "google_maven", 1)
+                // Termux's ARM64 AAPT2 — downloads multiple .deb packages
+                DownloadSource("termux://aapt2", "termux", 1)
             ),
             sha256 = "",
             installPath = "aapt2"

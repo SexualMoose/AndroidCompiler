@@ -189,6 +189,20 @@ class TermuxJdkInstaller @Inject constructor(
             packages.addAll(getFallbackPackages())
         }
 
+        // Ensure critical packages are always present (libc++ is needed by
+        // libandroid-spawn but may be missed in transitive dep resolution)
+        val requiredPackages = listOf("libc++")
+        val fallbackPkgs = getFallbackPackages()
+        for (required in requiredPackages) {
+            if (packages.none { it.name == required }) {
+                val fallback = fallbackPkgs.firstOrNull { it.name == required }
+                if (fallback != null) {
+                    onLog("Adding required package: $required")
+                    packages.add(fallback)
+                }
+            }
+        }
+
         // Deduplicate
         return packages.distinctBy { it.name }
     }
@@ -314,16 +328,22 @@ class TermuxJdkInstaller @Inject constructor(
     /**
      * Extract TAR archive entries.
      * Strips the Termux prefix (data/data/com.termux/files/usr/) to get clean paths.
+     *
+     * Handles GNU TAR long name extensions (././@LongLink with type 'L' and 'K')
+     * which are used when paths exceed the 100-byte name field limit.
      */
     private fun extractTar(input: java.io.InputStream, targetDir: File) {
         val header = ByteArray(512)
+        var pendingLongName: String? = null
+        var pendingLongLink: String? = null
+
         while (true) {
             val headerRead = readFully(input, header)
             if (headerRead < 512) break
             if (header.all { it == 0.toByte() }) break
 
             val rawName = String(header, 0, 100).trim('\u0000', ' ')
-            if (rawName.isEmpty()) break
+            if (rawName.isEmpty() && pendingLongName == null) break
 
             val sizeOctal = String(header, 124, 12).trim('\u0000', ' ')
             val size = if (sizeOctal.isNotEmpty()) {
@@ -332,9 +352,37 @@ class TermuxJdkInstaller @Inject constructor(
 
             val typeFlag = header[156]
 
-            // Handle USTAR prefix
-            val prefix = String(header, 345, 155).trim('\u0000', ' ')
-            var fullName = if (prefix.isNotEmpty()) "$prefix/$rawName" else rawName
+            // GNU TAR long name: type 'L' means the data is the full filename
+            // for the NEXT entry (used when paths > 100 chars)
+            if (typeFlag.toInt().toChar() == 'L') {
+                val nameBytes = ByteArray(size.toInt())
+                readFully(input, nameBytes)
+                pendingLongName = String(nameBytes).trim('\u0000')
+                val padding = roundUp512(size) - size
+                if (padding > 0) skipBytes(input, padding)
+                continue
+            }
+
+            // GNU TAR long link target: type 'K'
+            if (typeFlag.toInt().toChar() == 'K') {
+                val linkBytes = ByteArray(size.toInt())
+                readFully(input, linkBytes)
+                pendingLongLink = String(linkBytes).trim('\u0000')
+                val padding = roundUp512(size) - size
+                if (padding > 0) skipBytes(input, padding)
+                continue
+            }
+
+            // Use the pending long name if available, otherwise construct from header
+            var fullName = if (pendingLongName != null) {
+                val name = pendingLongName!!
+                pendingLongName = null
+                name
+            } else {
+                // Handle USTAR prefix
+                val prefix = String(header, 345, 155).trim('\u0000', ' ')
+                if (prefix.isNotEmpty()) "$prefix/$rawName" else rawName
+            }
 
             // Strip Termux prefix: data/data/com.termux/files/usr/ → ""
             // Also handle ./data/data/... prefix
@@ -343,23 +391,29 @@ class TermuxJdkInstaller @Inject constructor(
                 fullName = fullName.removePrefix(TERMUX_PREFIX).removePrefix("/")
             } else if (fullName.startsWith("data/")) {
                 // Skip non-usr files (control files, etc.)
+                pendingLongLink = null
                 skipTarEntry(input, size)
                 continue
             }
 
             if (fullName.isEmpty() || fullName == ".") {
+                pendingLongLink = null
                 skipTarEntry(input, size)
                 continue
             }
 
             val outFile = File(targetDir, fullName)
             if (!outFile.canonicalPath.startsWith(targetDir.canonicalPath)) {
+                pendingLongLink = null
                 skipTarEntry(input, size)
                 continue
             }
 
             when (typeFlag.toInt().toChar()) {
-                '5', 'D' -> outFile.mkdirs()
+                '5', 'D' -> {
+                    outFile.mkdirs()
+                    pendingLongLink = null
+                }
                 '0', '\u0000' -> {
                     // Regular file
                     outFile.parentFile?.mkdirs()
@@ -371,16 +425,18 @@ class TermuxJdkInstaller @Inject constructor(
                         FileOutputStream(outFile).use { out ->
                             copyBytes(input, out, size)
                         }
-                    } catch (e: Exception) {
-                        // Skip files that can't be written (EISDIR, permission, etc)
-                        skipBytes(input, size - size) // data already consumed by copyBytes attempt
+                    } catch (_: Exception) {
+                        // If write failed partway, we still need to skip remaining data
                     }
                     val padding = roundUp512(size) - size
                     if (padding > 0) skipBytes(input, padding)
+                    pendingLongLink = null
                 }
                 '2' -> {
-                    // Symlink
-                    val linkTarget = String(header, 157, 100).trim('\u0000', ' ')
+                    // Symlink — use pending long link target if available
+                    val linkTarget = pendingLongLink
+                        ?: String(header, 157, 100).trim('\u0000', ' ')
+                    pendingLongLink = null
                     // Remove existing file/dir before creating symlink
                     if (outFile.exists()) {
                         if (outFile.isDirectory) outFile.deleteRecursively() else outFile.delete()
@@ -393,7 +449,10 @@ class TermuxJdkInstaller @Inject constructor(
                     } catch (_: Exception) { }
                     skipTarEntry(input, size)
                 }
-                else -> skipTarEntry(input, size)
+                else -> {
+                    pendingLongLink = null
+                    skipTarEntry(input, size)
+                }
             }
         }
     }

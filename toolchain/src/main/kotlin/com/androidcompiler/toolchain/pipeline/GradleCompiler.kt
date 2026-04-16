@@ -94,48 +94,70 @@ class GradleCompiler @Inject constructor(
         // Configure for on-device build
         injectGradleProperties(projectDir, onLog)
 
-        // Build command — use the real JDK's java binary
+        // Build command via /system/bin/sh — required because /data is noexec.
+        // ProcessBuilder can't execute binaries from /data directly, but
+        // /system/bin/sh (on exec-mounted /system) CAN exec them.
         val gradleHome = File(context.filesDir, "gradle_home").apply { mkdirs() }
 
-        val command = mutableListOf(
-            javaBin.absolutePath,
-            "-Xmx3g",
-            "-Dfile.encoding=UTF-8",
-            "-Dorg.gradle.appname=gradlew",
-            "-Dorg.gradle.java.home=${javaHome.absolutePath}",
-            "-cp", wrapperJar.absolutePath,
-            "org.gradle.wrapper.GradleWrapperMain",
-            "assembleDebug",
-            "--no-daemon",
-            "--console=plain",
-            "--warning-mode=all"
-        )
-
-        val env = mutableMapOf<String, String>()
-        env["JAVA_HOME"] = javaHome.absolutePath
-        env["ANDROID_HOME"] = androidSdk?.absolutePath ?: ""
-        env["ANDROID_SDK_ROOT"] = androidSdk?.absolutePath ?: ""
-        env["GRADLE_USER_HOME"] = gradleHome.absolutePath
-        env["PATH"] = "${javaHome.absolutePath}/bin:/system/bin:/system/xbin:${System.getenv("PATH") ?: ""}"
-
-        // LD_LIBRARY_PATH must include BOTH:
-        // - javaHome/lib (JDK's own libs: libjli.so, libjvm.so, etc.)
-        // - jdk17/lib (Termux dependency libs: libz.so, libc++_shared.so, libiconv, etc.)
+        // Build LD_LIBRARY_PATH
         val ldPaths = mutableListOf<String>()
         val jdkLib = File(javaHome, "lib")
         if (jdkLib.exists()) ldPaths.add(jdkLib.absolutePath)
-        // The parent "jdk17/lib" has Termux native deps
         val termuxLibDir = File(jdkInstaller.jdkDir, "lib")
         if (termuxLibDir.exists()) ldPaths.add(termuxLibDir.absolutePath)
-        // Also add server/client JVM dirs
         File(jdkLib, "server").let { if (it.exists()) ldPaths.add(it.absolutePath) }
-        File(jdkLib, "client").let { if (it.exists()) ldPaths.add(it.absolutePath) }
-        env["LD_LIBRARY_PATH"] = ldPaths.joinToString(":") +
-            ":${System.getenv("LD_LIBRARY_PATH") ?: ""}"
+        val ldPath = ldPaths.joinToString(":")
+
+        // Temp dir — the Termux JDK defaults to /data/data/com.termux/files/usr/tmp
+        // which doesn't exist on devices without Termux. Override to app cache.
+        val tmpDir = File(context.cacheDir, "tmp").apply { mkdirs() }
+
+        // User home — the Termux JDK defaults to /data/data/com.termux/files/home
+        // which doesn't exist. AGP's AndroidLocationsBuildService needs ~/.android/.
+        val userHome = File(context.filesDir, "home").apply { mkdirs() }
+        File(userHome, ".android").mkdirs()
+
+        // Build the full shell command with env vars inline
+        val shellCmd = buildString {
+            append("export JAVA_HOME='${javaHome.absolutePath}' && ")
+            append("export ANDROID_HOME='${androidSdk?.absolutePath ?: ""}' && ")
+            append("export ANDROID_SDK_ROOT='${androidSdk?.absolutePath ?: ""}' && ")
+            append("export ANDROID_USER_HOME='${userHome.absolutePath}/.android' && ")
+            append("export GRADLE_USER_HOME='${gradleHome.absolutePath}' && ")
+            append("export PATH='${javaHome.absolutePath}/bin:/system/bin:/system/xbin' && ")
+            append("export LD_LIBRARY_PATH='$ldPath' && ")
+            append("export TMPDIR='${tmpDir.absolutePath}' && ")
+            append("export HOME='${userHome.absolutePath}' && ")
+            // JAVA_TOOL_OPTIONS is read by ALL JVM instances (wrapper + daemon).
+            // This ensures the forked daemon JVM also uses fork() for ProcessBuilder
+            // and has correct tmpdir/user.home. Gradle strips custom -D from daemon opts.
+            append("export JAVA_TOOL_OPTIONS='-Djdk.lang.Process.launchMechanism=FORK -Djava.io.tmpdir=${tmpDir.absolutePath} -Duser.home=${userHome.absolutePath}' && ")
+            append("exec '${javaBin.absolutePath}' ")
+            append("-Xmx4g ")
+            append("-Dfile.encoding=UTF-8 ")
+            append("-Djava.io.tmpdir='${tmpDir.absolutePath}' ")
+            append("-Duser.home='${userHome.absolutePath}' ")
+            append("-Djdk.lang.Process.launchMechanism=FORK ")
+            append("-Djava.library.path='$ldPath' ")
+            append("-Dorg.gradle.appname=gradlew ")
+            append("-Dorg.gradle.java.home='${javaHome.absolutePath}' ")
+            append("-cp '${wrapperJar.absolutePath}' ")
+            append("org.gradle.wrapper.GradleWrapperMain ")
+            append("assembleDebug ")
+            append("--no-daemon ")
+            append("--console=plain ")
+            append("--warning-mode=all")
+        }
+
+        // Execute via /system/bin/sh which is on an exec-mounted partition.
+        // With targetSdk=28, the app runs in untrusted_app_29 SELinux domain
+        // which allows executing binaries from the app's data directory.
+        val command = listOf("/system/bin/sh", "-c", shellCmd)
 
         onLog("Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
+        onLog("LD_LIBRARY_PATH: $ldPath", ErrorSeverity.INFO)
 
-        val result = executeGradleBuild(command, projectDir, env, onLog)
+        val result = executeGradleBuild(command, projectDir, onLog)
 
         if (result.exitCode != 0) {
             val allOutput = result.stderr + "\n" + result.stdout
@@ -188,28 +210,77 @@ class GradleCompiler @Inject constructor(
     }
 
     private fun findAndroidSdk(): File? {
-        return listOfNotNull(
+        // Priority 1: Real SDK from environment or Termux
+        listOfNotNull(
             System.getenv("ANDROID_HOME"),
             System.getenv("ANDROID_SDK_ROOT"),
             "/data/data/com.termux/files/home/android-sdk"
         ).map { File(it) }.firstOrNull { it.exists() && File(it, "platforms").exists() }
+            ?.let { return it }
+
+        // Priority 2: Create minimal SDK from our bundled android.jar
+        val androidJar = registry.getAndroidJar()
+        if (androidJar.exists()) {
+            val sdkRoot = File(context.filesDir, "android-sdk")
+            val platformDir = File(sdkRoot, "platforms/android-35")
+            platformDir.mkdirs()
+            val targetJar = File(platformDir, "android.jar")
+            if (!targetJar.exists() || targetJar.length() != androidJar.length()) {
+                androidJar.copyTo(targetJar, overwrite = true)
+            }
+            // Pre-accept SDK licenses so AGP doesn't reject the synthetic SDK
+            val licensesDir = File(sdkRoot, "licenses").apply { mkdirs() }
+            File(licensesDir, "android-sdk-license").writeText(
+                "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n" +
+                "\n84831b9409646a918e30573bab4c9c91346d8abd\n" +
+                "\nd975f751698a77b662f1254ddbeed3901e976f5a\n"
+            )
+            File(licensesDir, "android-sdk-preview-license").writeText(
+                "\n84831b9409646a918e30573bab4c9c91346d8abd\n"
+            )
+            return sdkRoot
+        }
+
+        return null
     }
 
     private fun injectGradleProperties(projectDir: File, onLog: LogCallback) {
         val propsFile = File(projectDir, "gradle.properties")
         val existing = if (propsFile.exists()) propsFile.readText() else ""
 
+        val javaHome = findJavaHome()
+        val jdkLibDir = jdkInstaller.jdkDir.absolutePath + "/lib"
+        val jdkVmLib = javaHome?.absolutePath?.let { "$it/lib" } ?: ""
+
+        // Remove any existing org.gradle.jvmargs lines so we can set our own
+        val cleaned = existing.lines()
+            .filter { !it.trim().startsWith("org.gradle.jvmargs") }
+            .joinToString("\n")
+
         val injected = buildString {
-            append(existing)
+            append(cleaned)
             appendLine()
             appendLine("# === AndroidCompiler on-device build settings ===")
+            // Force ALL compilation in-process — no forked java processes
             appendLine("kotlin.compiler.execution.strategy=in-process")
             appendLine("org.gradle.daemon=false")
             appendLine("org.gradle.workers.max=2")
             appendLine("org.gradle.configuration-cache=false")
-            appendLine("org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8")
             appendLine("org.gradle.parallel=true")
             appendLine("android.useAndroidX=true")
+            // CRITICAL: These JVM args MUST match what we pass on the java command line
+            // in GradleCompiler.compile(). If they differ, Gradle forks a daemon process.
+            // -Djdk.lang.Process.launchMechanism=FORK is required because Android's bionic
+            // libc posix_spawn() doesn't work for process creation; fork() does.
+            // -Djava.library.path ensures native libs (libjvm.so etc) are found by child processes.
+            val tmpDir = File(context.cacheDir, "tmp").absolutePath
+            val userHome = File(context.filesDir, "home").absolutePath
+            appendLine("org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8 -Djava.io.tmpdir=$tmpDir -Duser.home=$userHome -Djdk.lang.Process.launchMechanism=FORK -Djava.library.path=$jdkVmLib:$jdkLibDir")
+            // Use our bundled ARM64 AAPT2 instead of AGP's x86_64 Linux binary
+            val aapt2 = registry.getAapt2Binary()
+            if (aapt2.exists()) {
+                appendLine("android.aapt2FromMavenOverride=${aapt2.absolutePath}")
+            }
         }
         propsFile.writeText(injected)
         onLog("Gradle properties configured", ErrorSeverity.INFO)
@@ -267,14 +338,12 @@ zipStorePath=wrapper/dists
     private fun executeGradleBuild(
         command: List<String>,
         workingDir: File,
-        env: Map<String, String>,
         onLog: LogCallback
     ): ProcessResult {
         try {
             val process = ProcessBuilder(command)
                 .directory(workingDir)
                 .redirectErrorStream(false)
-                .also { it.environment().putAll(env) }
                 .start()
 
             val stdoutBuilder = StringBuilder()

@@ -13,8 +13,11 @@ android {
 
     defaultConfig {
         applicationId = "com.androidcompiler"
-        minSdk = 35
-        targetSdk = 35
+        minSdk = 28
+        targetSdk = 28 // Must be <=28 to run in untrusted_app_29 SELinux domain
+                       // which allows executing binaries from app data directory.
+                       // Android 15's untrusted_app (targetSdk 33+) blocks all exec
+                       // from app_data_file. This is how Termux works too.
         versionCode = 1
         versionName = "1.0.0"
 
