@@ -222,11 +222,15 @@ class GradleCompiler @Inject constructor(
         val androidJar = registry.getAndroidJar()
         if (androidJar.exists()) {
             val sdkRoot = File(context.filesDir, "android-sdk")
-            val platformDir = File(sdkRoot, "platforms/android-35")
-            platformDir.mkdirs()
-            val targetJar = File(platformDir, "android.jar")
-            if (!targetJar.exists() || targetJar.length() != androidJar.length()) {
-                androidJar.copyTo(targetJar, overwrite = true)
+            // Create platform dirs for multiple possible names AGP might look for
+            // (e.g., android-35, android-35-2, android-35-ext14)
+            for (suffix in listOf("android-35", "android-35-2", "android-35-ext14")) {
+                val platformDir = File(sdkRoot, "platforms/$suffix")
+                platformDir.mkdirs()
+                val targetJar = File(platformDir, "android.jar")
+                if (!targetJar.exists() || targetJar.length() != androidJar.length()) {
+                    androidJar.copyTo(targetJar, overwrite = true)
+                }
             }
             // Pre-accept SDK licenses so AGP doesn't reject the synthetic SDK
             val licensesDir = File(sdkRoot, "licenses").apply { mkdirs() }

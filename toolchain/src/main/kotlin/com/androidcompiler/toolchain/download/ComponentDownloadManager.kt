@@ -263,7 +263,8 @@ class ComponentDownloadManager @Inject constructor(
                             val padding = roundUp512(size) - size
                             if (padding > 0) skipBytes(input, padding)
                         }
-                        fileName.endsWith(".so") && fullName.startsWith("lib/") -> {
+                        // Match .so files including versioned names like libexpat.so.1.11.3
+                        ".so" in fileName && fullName.startsWith("lib/") -> {
                             val outFile = File(libDir, fileName)
                             FileOutputStream(outFile).use { out ->
                                 copyBytes(input, out, size)
@@ -276,6 +277,21 @@ class ComponentDownloadManager @Inject constructor(
                             skipBytes(input, roundUp512(size))
                         }
                     }
+                }
+                '2' -> {
+                    // Symlink — create for versioned .so files (e.g., libexpat.so.1 -> libexpat.so.1.11.3)
+                    val linkTarget = String(header, 157, 100).trim('\u0000', ' ')
+                    val fileName = File(fullName).name
+                    if (".so" in fileName && fullName.startsWith("lib/")) {
+                        val outFile = File(libDir, fileName)
+                        if (outFile.exists()) outFile.delete()
+                        try {
+                            val osClass = Class.forName("android.system.Os")
+                            osClass.getMethod("symlink", String::class.java, String::class.java)
+                                .invoke(null, linkTarget, outFile.absolutePath)
+                        } catch (_: Exception) { }
+                    }
+                    skipBytes(input, roundUp512(size))
                 }
                 else -> skipBytes(input, roundUp512(size))
             }
