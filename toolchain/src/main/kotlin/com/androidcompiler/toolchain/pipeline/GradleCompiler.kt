@@ -90,6 +90,25 @@ class GradleCompiler @Inject constructor(
         onLog("JDK: ${javaHome.absolutePath}", ErrorSeverity.INFO)
         onLog("java: ${javaBin.absolutePath} ${if (bundledJava) "(bundled APK)" else "(downloaded)"}", ErrorSeverity.INFO)
 
+        // When using the bundled launcher, Gradle will still internally try to
+        // spawn `$JAVA_HOME/bin/java` (JVM probing), `$JAVA_HOME/bin/jlink`
+        // (JdkImageTransform), and possibly other tools directly. On targetSdk=35
+        // those downloaded binaries in /data/data/ cannot be exec'd by SELinux.
+        // Replace each with a symlink to its APK-bundled counterpart — exec
+        // follows symlinks to the target's SELinux label, which is exec-allowed.
+        if (bundledJava) {
+            linkJdkToolsToBundled(javaHome, onLog)
+        }
+
+        // Same problem for AAPT2 — AGP requires the override path to end in
+        // `aapt2` (not `libaapt2.so`). We expose a symlink at the expected
+        // name pointing to the bundled binary. The symlink lives in app_data_file
+        // but exec's through to the nativeLibraryDir label, so SELinux allows it.
+        val bundledAapt2Source = registry.getBundledAapt2()
+        if (bundledAapt2Source != null && bundledAapt2Source.exists()) {
+            linkAapt2ToBundled(bundledAapt2Source, onLog)
+        }
+
         // Ensure wrapper JAR (version-specific if available, fallback to bundled)
         val wrapperJar = ensureGradleWrapperJar(projectDir, effectiveGradleVersion, onLog)
         if (wrapperJar == null) {
@@ -334,6 +353,99 @@ exec '${realBin.absolutePath}' "${'$'}@"
     }
 
     /**
+     * Replaces each `$JAVA_HOME/bin/<tool>` with a symlink pointing to the
+     * matching APK-bundled launcher in nativeLibraryDir. Needed because
+     * Gradle's internal JVM probe execs `$javaHome/bin/java` and AGP's
+     * JdkImageTransform execs `$javaHome/bin/jlink` directly — on targetSdk=35
+     * those paths live in app_data_file which SELinux disallows exec for.
+     *
+     * Symlink target's SELinux label governs the exec check, so this lets the
+     * exec succeed without giving up the JAVA_HOME pointed at the downloaded
+     * JDK (which is still needed for JDK modules, libjvm.so, etc).
+     *
+     * Always regenerates — app reinstalls change the native lib dir (install
+     * hash changes) so stale symlinks from a previous install would dangle.
+     */
+    private fun linkJdkToolsToBundled(javaHome: File, onLog: LogCallback) {
+        // (jdk-bin-name → bundled-lib-name). Only tools where we have a
+        // corresponding bundled launcher in nativeLibraryDir get linked; the
+        // rest stay as their originally-downloaded file (Gradle won't use most
+        // of them, but if it does it'll fail loudly and we'll add one more).
+        val toolMap = mapOf(
+            "java" to "libjava.so",
+            "jlink" to "libjlink.so",
+            "javac" to "libjavac.so",
+            "jar" to "libjar.so",
+            "jdeps" to "libjdeps.so",
+            "jmod" to "libjmod.so",
+            "keytool" to "libkeytool.so"
+        )
+        val nativeLibDir = File(context.applicationInfo.nativeLibraryDir)
+        val linked = mutableListOf<String>()
+        val osClass = try { Class.forName("android.system.Os") } catch (e: Exception) {
+            onLog("Warning: android.system.Os not available: ${e.message}", ErrorSeverity.WARNING)
+            return
+        }
+
+        for ((tool, libName) in toolMap) {
+            val bundled = File(nativeLibDir, libName)
+            if (!bundled.exists()) continue
+            val jdkBin = File(javaHome, "bin/$tool")
+            try {
+                jdkBin.parentFile?.mkdirs()
+                // Unconditional replace — exists() returns false for dangling
+                // symlinks, so also unlink by path if lstat shows an entry.
+                if (jdkBin.exists()) jdkBin.delete()
+                else {
+                    try {
+                        osClass.getMethod("lstat", String::class.java)
+                            .invoke(null, jdkBin.absolutePath)
+                        File(jdkBin.absolutePath).delete()
+                    } catch (_: Exception) { }
+                }
+                osClass.getMethod("symlink", String::class.java, String::class.java)
+                    .invoke(null, bundled.absolutePath, jdkBin.absolutePath)
+                linked.add(tool)
+            } catch (e: Exception) {
+                onLog("Warning: could not link $tool: ${e.message}", ErrorSeverity.WARNING)
+            }
+        }
+        if (linked.isNotEmpty()) {
+            onLog("Linked JDK tools to bundled launchers: ${linked.joinToString(", ")}", ErrorSeverity.INFO)
+        }
+    }
+
+    /**
+     * Exposes the bundled AAPT2 (lib/<abi>/libaapt2.so in the APK) at a path
+     * named `aapt2` via symlink. AGP's android.aapt2FromMavenOverride enforces
+     * that the executable is named exactly `aapt2` — the native-lib naming
+     * convention is incompatible. Symlink exec resolves through to the target's
+     * SELinux label, which is exec-allowed even on targetSdk=35.
+     */
+    private fun linkAapt2ToBundled(bundled: File, onLog: LogCallback) {
+        try {
+            val binDir = File(registry.toolchainDir, "aapt2-prefix/bin").apply { mkdirs() }
+            val binPath = File(binDir, "aapt2")
+            val osClass = Class.forName("android.system.Os")
+
+            if (binPath.exists()) binPath.delete()
+            else {
+                try {
+                    osClass.getMethod("lstat", String::class.java)
+                        .invoke(null, binPath.absolutePath)
+                    binPath.delete() // dangling symlink cleanup
+                } catch (_: Exception) { }
+            }
+
+            osClass.getMethod("symlink", String::class.java, String::class.java)
+                .invoke(null, bundled.absolutePath, binPath.absolutePath)
+            onLog("Linked ${binPath.absolutePath} → ${bundled.absolutePath}", ErrorSeverity.INFO)
+        } catch (e: Exception) {
+            onLog("Warning: could not link AAPT2 to bundled: ${e.message}", ErrorSeverity.WARNING)
+        }
+    }
+
+    /**
      * Resolves which `android.jar` file to use for a requested API level.
      * Checks (in order):
      *   1. The version-specific variant at toolchain/android-jar-variants/android-N.jar
@@ -457,16 +569,32 @@ exec '${realBin.absolutePath}' "${'$'}@"
                 File(btDir, "source.properties").writeText(
                     "Pkg.Revision=35.0.0\nPkg.Desc=Android SDK Build-Tools 35\n"
                 )
-                // AAPT2 — our wrapper with LD_LIBRARY_PATH
+                // AAPT2 — when the source is the bundled binary (in
+                // nativeLibraryDir), use a symlink so SELinux's exec check
+                // follows through to the exec-allowed label. Otherwise copy
+                // (legacy path — downloaded aapt2 in app_data_file).
                 val btAapt2 = File(btDir, "aapt2")
-                aapt2Src.copyTo(btAapt2, overwrite = true)
-                btAapt2.setExecutable(true, false)
-                // Copy the real binary too if wrapper references it
-                val realBin = File(aapt2Src.parentFile, "aapt2-real")
-                if (realBin.exists()) {
-                    val btReal = File(btDir, "aapt2-real")
-                    if (!btReal.exists()) realBin.copyTo(btReal)
-                    btReal.setExecutable(true, false)
+                if (btAapt2.exists()) btAapt2.delete()
+                val isBundledSrc = aapt2Src == registry.getBundledAapt2()
+                if (isBundledSrc) {
+                    try {
+                        Class.forName("android.system.Os")
+                            .getMethod("symlink", String::class.java, String::class.java)
+                            .invoke(null, aapt2Src.absolutePath, btAapt2.absolutePath)
+                    } catch (_: Exception) {
+                        aapt2Src.copyTo(btAapt2, overwrite = true)
+                        btAapt2.setExecutable(true, false)
+                    }
+                } else {
+                    aapt2Src.copyTo(btAapt2, overwrite = true)
+                    btAapt2.setExecutable(true, false)
+                    // Legacy wrapper needs aapt2-real next to it
+                    val realBin = File(aapt2Src.parentFile, "aapt2-real")
+                    if (realBin.exists()) {
+                        val btReal = File(btDir, "aapt2-real")
+                        if (!btReal.exists()) realBin.copyTo(btReal)
+                        btReal.setExecutable(true, false)
+                    }
                 }
                 // Stub scripts for tools that AGP checks but doesn't run in modern builds
                 for (tool in listOf("aapt", "aidl", "dx", "dexdump", "split-select",
@@ -541,11 +669,14 @@ exec '${realBin.absolutePath}' "${'$'}@"
             val tmpDir = File(context.cacheDir, "tmp").absolutePath
             val userHome = File(context.filesDir, "home").absolutePath
             appendLine("org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8 -Djava.io.tmpdir=$tmpDir -Duser.home=$userHome -Djdk.lang.Process.launchMechanism=FORK -Djava.library.path=$jdkVmLib:$jdkLibDir")
-            // Use our ARM64 AAPT2 instead of AGP's x86_64 Linux binary.
-            // Prefer the bundled (nativeLibraryDir) binary — exec-allowed in every
-            // targetSdk. Fall back to the downloaded one for legacy installs.
-            val aapt2 = pickAapt2Binary()
-            if (aapt2 != null && aapt2.exists()) {
+            // AGP's android.aapt2FromMavenOverride enforces that the pointed-to
+            // file is named exactly `aapt2` (not `libaapt2.so`). Always use
+            // `toolchain/aapt2-prefix/bin/aapt2` — that's either:
+            //  - a symlink pointing at the bundled lib<abi>/libaapt2.so
+            //    (created by linkAapt2ToBundled during this compile), OR
+            //  - the downloaded Termux binary (legacy pre-bundled code path).
+            val aapt2 = registry.getAapt2Binary()
+            if (aapt2.exists()) {
                 appendLine("android.aapt2FromMavenOverride=${aapt2.absolutePath}")
             }
         }

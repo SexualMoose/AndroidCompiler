@@ -85,12 +85,15 @@ class ToolchainRegistry @Inject constructor(
         ToolchainComponent(
             id = "d8",
             displayName = "D8 DEX Compiler",
-            version = "8.7.3",
-            sizeBytes = 20_971_520,
+            version = "8.9.35",
+            sizeBytes = 22_020_096,
             type = ComponentType.JAR,
             sources = listOf(
-                DownloadSource("https://dl.google.com/android/maven2/com/android/tools/r8/8.7.3/r8-8.7.3.jar", "google_maven", 1),
-                DownloadSource("https://repo1.maven.org/maven2/com/android/tools/r8/8.7.3/r8-8.7.3.jar", "maven_central", 2)
+                // Google retires older R8 artifacts from their Maven mirror (404s
+                // leave behind an HTML error page saved as r8.jar). Pinning to a
+                // currently-available version; update via ComponentUpdateChecker.
+                DownloadSource("https://dl.google.com/android/maven2/com/android/tools/r8/8.9.35/r8-8.9.35.jar", "google_maven", 1),
+                DownloadSource("https://repo1.maven.org/maven2/com/android/tools/r8/8.9.35/r8-8.9.35.jar", "maven_central", 2)
             ),
             sha256 = "",
             installPath = "r8.jar"
@@ -130,10 +133,14 @@ class ToolchainRegistry @Inject constructor(
                 // API 34 — compatible with AAPT2 v2.19 (API 35's resources.arsc uses
                 // a newer format that AAPT2 v2.19 can't parse: "illegal map type 'string' (22)").
                 // URLs verified against https://dl.google.com/android/repository/repository2-3.xml.
+                // API 34 only — the Termux AAPT2 v2.19 bundled with this app
+                // segfaults on API 35's newer resources.arsc format. Users who
+                // need to compile against API 35 can use the multi-version
+                // Android SDK variants (downloaded separately in Components tab).
                 DownloadSource("https://dl.google.com/android/repository/platform-34-ext7_r03.zip", "google-ext7", 1),
                 DownloadSource("https://dl.google.com/android/repository/platform-34-ext8_r01.zip", "google-ext8", 2),
-                DownloadSource("https://dl.google.com/android/repository/platform-35_r02.zip", "google-35", 3),
-                DownloadSource("https://dl.google.com/android/repository/platform-35-ext14_r01.zip", "google-35-ext14", 4)
+                DownloadSource("https://dl.google.com/android/repository/platform-34-ext10_r01.zip", "google-ext10", 3),
+                DownloadSource("https://dl.google.com/android/repository/platform-34-ext11_r01.zip", "google-ext11", 4)
             ),
             sha256 = "",
             installPath = "android.jar"
@@ -149,6 +156,18 @@ class ToolchainRegistry @Inject constructor(
                    else ComponentStatus.NotInstalled
         }
         val file = getComponentFile(component)
+        // For AAPT2 specifically: the declared installPath is
+        // aapt2-prefix/bin/aapt2, which GradleCompiler turns into a symlink
+        // into nativeLibraryDir. That symlink dangles after an app reinstall
+        // (new install hash), so File.exists() returns false even though the
+        // downloaded .so dependencies (the heavy ~7MB) are intact. Treat AAPT2
+        // as Installed whenever its lib dir is populated — the symlink gets
+        // re-created on each compile.
+        if (component.id == "aapt2") {
+            val libDir = getAapt2LibDir()
+            val soCount = libDir.listFiles()?.count { it.name.endsWith(".so") || ".so." in it.name } ?: 0
+            if (soCount >= 20) return ComponentStatus.Installed
+        }
         return if (file.exists() && file.length() > 0) {
             ComponentStatus.Installed
         } else {

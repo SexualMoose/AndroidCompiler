@@ -12,11 +12,19 @@ plugins {
 }
 
 nativeBinaries {
-    packageUrls.set(listOf(
-        // AAPT2 (Android Asset Packaging Tool v2) — ARM64, build tools 13.0.0.6
-        "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
-        // OpenJDK 17 — ships the `java` launcher and libjli.so
-        "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb"
+    // Ship native binaries for both primary Android ABIs.
+    // arm64-v8a covers every modern phone (S26 Ultra, etc.); x86_64 covers
+    // Chromebooks, Windows Subsystem for Android, and the stock Android Studio
+    // emulator for iterative development.
+    packagesByAbi.set(mapOf(
+        "arm64-v8a" to listOf(
+            "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
+            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb"
+        ),
+        "x86_64" to listOf(
+            "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_x86_64.deb",
+            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_x86_64.deb"
+        )
     ))
 }
 
@@ -35,9 +43,10 @@ android {
         versionCode = 2
         versionName = "1.1.0"
 
-        // Only build ARM64 binaries — that's the only ABI we target.
+        // Ship both primary Android ABIs. arm64-v8a is the real-device target,
+        // x86_64 lets Android Studio's stock emulator run the same APK.
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

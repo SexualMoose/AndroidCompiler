@@ -134,16 +134,16 @@ class ComponentDownloadManager @Inject constructor(
      */
     private suspend fun installTermuxAapt2(targetFile: File, onProgress: (Float) -> Unit) {
         val repo = "https://packages.termux.dev/apt/termux-main"
-        val packages = listOf(
-            "$repo/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
-            "$repo/pool/main/a/aapt/aapt_13.0.0.6-23_aarch64.deb",
-            "$repo/pool/main/a/abseil-cpp/abseil-cpp_20250814.1_aarch64.deb",
-            "$repo/pool/main/libp/libprotobuf/libprotobuf_2%3A33.1-1_aarch64.deb",
-            "$repo/pool/main/f/fmt/fmt_1%3A11.2.0_aarch64.deb",
-            "$repo/pool/main/libe/libexpat/libexpat_2.7.5_aarch64.deb",
-            "$repo/pool/main/libp/libpng/libpng_1.6.57_aarch64.deb",
-            "$repo/pool/main/libz/libzopfli/libzopfli_1.0.3-5_aarch64.deb",
+        val arch = TermuxJdkInstaller.termuxArch()
+        // Packages we need for AAPT2. Version numbers change over time so we
+        // resolve the current Filename from the Termux Packages index rather
+        // than hardcoding — a stale version means 404 and a silent extraction
+        // failure that leaves AAPT2 unable to load its .so deps.
+        val neededPackages = listOf(
+            "aapt2", "aapt", "abseil-cpp", "libprotobuf", "fmt",
+            "libexpat", "libpng", "libzopfli", "zlib", "libc++"
         )
+        val packages = resolvePackageUrls(repo, arch, neededPackages)
 
         // Lib dir in the AAPT2 prefix — matches RPATH ($ORIGIN/../lib from bin/)
         val libDir = registry.getAapt2LibDir()
@@ -187,6 +187,55 @@ class ComponentDownloadManager @Inject constructor(
 
         // Verify symlinks and fix any that are broken
         fixBrokenSymlinks(libDir)
+    }
+
+    /**
+     * Looks up current download URLs for a set of Termux package names by
+     * parsing the repo's Packages index. Falls back to a guessed URL pattern
+     * if the index lookup fails — that covers offline/proxy scenarios but will
+     * 404 if Termux rolled a new version since the fallback pattern was pinned.
+     */
+    private fun resolvePackageUrls(repo: String, arch: String, packageNames: List<String>): List<String> {
+        val indexUrl = "$repo/dists/stable/main/binary-$arch/Packages"
+        val indexContent = try {
+            java.net.URL(indexUrl).openStream().bufferedReader().use { it.readText() }
+        } catch (_: Exception) { "" }
+
+        val filenameByPkg = mutableMapOf<String, String>()
+        if (indexContent.isNotEmpty()) {
+            var currentPkg = ""
+            for (line in indexContent.lines()) {
+                when {
+                    line.startsWith("Package: ") ->
+                        currentPkg = line.removePrefix("Package: ").trim()
+                    line.startsWith("Filename: ") ->
+                        filenameByPkg[currentPkg] = line.removePrefix("Filename: ").trim()
+                }
+            }
+        }
+
+        return packageNames.map { pkg ->
+            val filename = filenameByPkg[pkg]
+            if (filename != null) "$repo/$filename" else fallbackTermuxUrl(repo, arch, pkg)
+        }
+    }
+
+    /**
+     * Last-resort URL guess when the Packages index can't be fetched. These
+     * versions will go stale over time — the index lookup is the primary path.
+     */
+    private fun fallbackTermuxUrl(repo: String, arch: String, pkg: String): String = when (pkg) {
+        "aapt2" -> "$repo/pool/main/a/aapt2/aapt2_13.0.0.6-23_$arch.deb"
+        "aapt" -> "$repo/pool/main/a/aapt/aapt_13.0.0.6-23_$arch.deb"
+        "abseil-cpp" -> "$repo/pool/main/a/abseil-cpp/abseil-cpp_20250814.1_$arch.deb"
+        "libprotobuf" -> "$repo/pool/main/libp/libprotobuf/libprotobuf_2%3A33.1-1_$arch.deb"
+        "fmt" -> "$repo/pool/main/f/fmt/fmt_1%3A11.2.0_$arch.deb"
+        "libexpat" -> "$repo/pool/main/libe/libexpat/libexpat_2.7.5_$arch.deb"
+        "libpng" -> "$repo/pool/main/libp/libpng/libpng_1.6.58_$arch.deb"
+        "libzopfli" -> "$repo/pool/main/libz/libzopfli/libzopfli_1.0.3-5_$arch.deb"
+        "zlib" -> "$repo/pool/main/z/zlib/zlib_1.3.2_$arch.deb"
+        "libc++" -> "$repo/pool/main/libc/libc++/libc++_29_$arch.deb"
+        else -> "$repo/pool/main/${pkg.first()}/$pkg/${pkg}_unknown_$arch.deb"
     }
 
     /**
@@ -281,6 +330,11 @@ class ComponentDownloadManager @Inject constructor(
                     when {
                         fullName == "bin/aapt2" -> {
                             aapt2Target.parentFile?.mkdirs()
+                            // A previous compile may have replaced this path with
+                            // a symlink into nativeLibraryDir. After reinstall the
+                            // symlink dangles and FileOutputStream fails trying
+                            // to create the non-existent target. Remove first.
+                            unlinkIfSymlink(aapt2Target)
                             FileOutputStream(aapt2Target).use { out ->
                                 copyBytes(input, out, size)
                             }
@@ -290,6 +344,7 @@ class ComponentDownloadManager @Inject constructor(
                         // Match .so files including versioned names like libexpat.so.1.11.3
                         ".so" in fileName && fullName.startsWith("lib/") -> {
                             val outFile = File(libDir, fileName)
+                            unlinkIfSymlink(outFile)
                             FileOutputStream(outFile).use { out ->
                                 copyBytes(input, out, size)
                             }
@@ -390,6 +445,23 @@ class ComponentDownloadManager @Inject constructor(
                 file.setReadable(true, false)
             }
         }
+    }
+
+    /**
+     * Removes a path if it's a symlink (possibly dangling). Regular files are
+     * left alone — FileOutputStream will truncate them. Dangling symlinks would
+     * cause FileOutputStream to try to create a file at the non-existent target,
+     * which throws because the app doesn't have write access to /data/app/.
+     */
+    private fun unlinkIfSymlink(file: File) {
+        try {
+            val osClass = Class.forName("android.system.Os")
+            val stat = osClass.getMethod("lstat", String::class.java)
+                .invoke(null, file.absolutePath)
+            val mode = stat.javaClass.getField("st_mode").getInt(stat)
+            val isSymlink = (mode and 0xF000) == 0xA000
+            if (isSymlink) file.delete()
+        } catch (_: Exception) { /* entry doesn't exist — fine, nothing to unlink */ }
     }
 
     private fun copyBytes(input: java.io.InputStream, output: java.io.OutputStream, count: Long) {

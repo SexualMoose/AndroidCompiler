@@ -39,9 +39,25 @@ class TermuxJdkInstaller @Inject constructor(
 ) {
     companion object {
         private const val TERMUX_REPO = "https://packages.termux.dev/apt/termux-main"
-        private const val PACKAGES_INDEX = "$TERMUX_REPO/dists/stable/main/binary-aarch64/Packages"
         private const val TERMUX_PREFIX = "data/data/com.termux/files/usr"
+
+        /**
+         * Primary ABI of this device as reported by Android.
+         * Returns either "aarch64" (arm64-v8a) or "x86_64" — our two supported
+         * architectures. Others fall through to aarch64 as the safest default.
+         */
+        fun termuxArch(): String {
+            val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+            return when (abi) {
+                "arm64-v8a" -> "aarch64"
+                "x86_64" -> "x86_64"
+                else -> "aarch64" // best-effort fallback for armv7/x86
+            }
+        }
     }
+
+    private val packagesIndexUrl: String
+        get() = "$TERMUX_REPO/dists/stable/main/binary-${termuxArch()}/Packages"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -52,26 +68,38 @@ class TermuxJdkInstaller @Inject constructor(
     val jdkDir: File get() = File(registry.toolchainDir, "jdk17")
 
     fun isInstalled(): Boolean {
+        // Check JDK content presence via files that don't get symlinked on reinstall:
+        // - lib/modules (the jimage containing all system modules, ~70MB)
+        // - lib/server/libjvm.so (the JVM)
+        // We deliberately avoid bin/java because GradleCompiler replaces it with
+        // a symlink to nativeLibraryDir, and that symlink dangles after an app
+        // reinstall (new install hash). The JDK is still usable — GradleCompiler
+        // re-creates the symlink on each compile.
         val javaHome = getJavaHome() ?: return false
-        val javaBin = File(javaHome, "bin/java")
-        val libDir = File(javaHome, "lib")
-        // Must have java binary AND lib directory (with modules/libjvm.so)
-        return javaBin.exists() && libDir.exists() && libDir.listFiles()?.isNotEmpty() == true
+        return File(javaHome, "lib/modules").exists() ||
+                File(javaHome, "lib/server/libjvm.so").exists()
     }
 
     fun getJavaHome(): File? {
+        // A JDK subdir "exists" if it has the real JDK content, even if bin/java
+        // happens to be a stale symlink from a previous install.
+        fun hasJdkContent(dir: File): Boolean =
+            File(dir, "lib/modules").exists() ||
+                    File(dir, "lib/server/libjvm.so").exists() ||
+                    File(dir, "bin/java").exists()
+
         // Direct: jdk17/bin/java
-        if (File(jdkDir, "bin/java").exists()) return jdkDir
+        if (hasJdkContent(jdkDir)) return jdkDir
         // Nested: jdk17/lib/jvm/java-17-openjdk/bin/java
         val jvmDir = File(jdkDir, "lib/jvm")
         if (jvmDir.exists()) {
             jvmDir.listFiles()?.forEach { child ->
-                if (File(child, "bin/java").exists()) return child
+                if (hasJdkContent(child)) return child
             }
         }
         // Single subdirectory
         jdkDir.listFiles()?.filter { it.isDirectory }?.forEach { child ->
-            if (File(child, "bin/java").exists()) return child
+            if (hasJdkContent(child)) return child
         }
         return null
     }
@@ -153,9 +181,9 @@ class TermuxJdkInstaller @Inject constructor(
     private fun findPackages(onLog: (String) -> Unit): List<PackageInfo> {
         val packages = mutableListOf<PackageInfo>()
 
-        // Try to fetch and parse the Packages index
+        // Try to fetch and parse the Packages index for our current arch
         try {
-            val request = Request.Builder().url(PACKAGES_INDEX).build()
+            val request = Request.Builder().url(packagesIndexUrl).build()
             val response = client.newCall(request).execute()
             val body = response.body?.string() ?: ""
             response.close()
@@ -256,15 +284,16 @@ class TermuxJdkInstaller @Inject constructor(
     }
 
     private fun getFallbackPackages(): List<PackageInfo> {
+        val arch = termuxArch()
         return listOf(
-            PackageInfo("openjdk-17", "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb", 95_507_372, emptyList()),
-            PackageInfo("libandroid-shmem", "$TERMUX_REPO/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb", 7_216, emptyList()),
-            PackageInfo("libandroid-spawn", "$TERMUX_REPO/pool/main/liba/libandroid-spawn/libandroid-spawn_0.3_aarch64.deb", 15_216, emptyList()),
-            PackageInfo("libiconv", "$TERMUX_REPO/pool/main/libi/libiconv/libiconv_1.18-1_aarch64.deb", 561_152, emptyList()),
-            PackageInfo("libjpeg-turbo", "$TERMUX_REPO/pool/main/libj/libjpeg-turbo/libjpeg-turbo_3.1.4.1_aarch64.deb", 384_504, emptyList()),
-            PackageInfo("littlecms", "$TERMUX_REPO/pool/main/l/littlecms/littlecms_2.18_aarch64.deb", 142_676, emptyList()),
-            PackageInfo("zlib", "$TERMUX_REPO/pool/main/z/zlib/zlib_1.3.2_aarch64.deb", 62_840, emptyList()),
-            PackageInfo("libc++", "$TERMUX_REPO/pool/main/libc/libc++/libc++_29_aarch64.deb", 334_828, emptyList()),
+            PackageInfo("openjdk-17", "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_17.0.18_$arch.deb", 95_507_372, emptyList()),
+            PackageInfo("libandroid-shmem", "$TERMUX_REPO/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_$arch.deb", 7_216, emptyList()),
+            PackageInfo("libandroid-spawn", "$TERMUX_REPO/pool/main/liba/libandroid-spawn/libandroid-spawn_0.3_$arch.deb", 15_216, emptyList()),
+            PackageInfo("libiconv", "$TERMUX_REPO/pool/main/libi/libiconv/libiconv_1.18-1_$arch.deb", 561_152, emptyList()),
+            PackageInfo("libjpeg-turbo", "$TERMUX_REPO/pool/main/libj/libjpeg-turbo/libjpeg-turbo_3.1.4.1_$arch.deb", 384_504, emptyList()),
+            PackageInfo("littlecms", "$TERMUX_REPO/pool/main/l/littlecms/littlecms_2.18_$arch.deb", 142_676, emptyList()),
+            PackageInfo("zlib", "$TERMUX_REPO/pool/main/z/zlib/zlib_1.3.2_$arch.deb", 62_840, emptyList()),
+            PackageInfo("libc++", "$TERMUX_REPO/pool/main/libc/libc++/libc++_29_$arch.deb", 334_828, emptyList()),
         )
     }
 
@@ -421,6 +450,16 @@ class TermuxJdkInstaller @Inject constructor(
                     if (outFile.exists() && outFile.isDirectory) {
                         outFile.deleteRecursively()
                     }
+                    // If path is a dangling/stale symlink (from a previous install's
+                    // nativeLibraryDir linked to by GradleCompiler.linkJdkToolsToBundled),
+                    // remove it so FileOutputStream can write through.
+                    try {
+                        val osClass = Class.forName("android.system.Os")
+                        val stat = osClass.getMethod("lstat", String::class.java)
+                            .invoke(null, outFile.absolutePath)
+                        val mode = stat.javaClass.getField("st_mode").getInt(stat)
+                        if ((mode and 0xF000) == 0xA000) outFile.delete()
+                    } catch (_: Exception) { }
                     try {
                         FileOutputStream(outFile).use { out ->
                             copyBytes(input, out, size)

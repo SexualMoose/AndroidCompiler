@@ -25,7 +25,7 @@ class AndroidNativeBinariesConventionPlugin : Plugin<Project> {
 
             val prepareTask = tasks.register<PrepareNativeBinariesTask>("prepareNativeBinaries") {
                 outputDir.set(layout.buildDirectory.dir("generated/native-jniLibs"))
-                packageUrls.set(ext.packageUrls)
+                packagesByAbi.set(ext.packagesByAbi)
             }
 
             // Wire the generated output into jniLibs source dirs.
@@ -52,5 +52,6 @@ class AndroidNativeBinariesConventionPlugin : Plugin<Project> {
 }
 
 abstract class NativeBinariesExtension {
-    abstract val packageUrls: org.gradle.api.provider.ListProperty<String>
+    /** ABI → list of .deb URLs for that ABI. e.g. "arm64-v8a" → [aapt2, openjdk-17]. */
+    abstract val packagesByAbi: org.gradle.api.provider.MapProperty<String, List<String>>
 }

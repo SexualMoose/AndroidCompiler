@@ -85,6 +85,11 @@ class ComponentsViewModel @Inject constructor(
                     }
                 }
             )
+            // Re-sync UI state with the filesystem. Some components report an error
+            // from the last attempted source even when an earlier source produced
+            // a valid file on disk — refreshing picks those up as Installed and
+            // unblocks the setup flow.
+            refreshAll()
             _isDownloadingAll.value = false
         }
     }

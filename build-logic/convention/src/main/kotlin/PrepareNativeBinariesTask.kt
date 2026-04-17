@@ -36,70 +36,100 @@ abstract class PrepareNativeBinariesTask : DefaultTask() {
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
+    /**
+     * Map of Android ABI (e.g. "arm64-v8a", "x86_64") to the list of Termux
+     * .deb URLs for that ABI. The task extracts `bin/aapt2`, `bin/java`, and
+     * `lib/libjli.so` from each package into jniLibs/<abi>/.
+     */
     @get:Input
-    abstract val packageUrls: ListProperty<String>
+    abstract val packagesByAbi: org.gradle.api.provider.MapProperty<String, List<String>>
 
     init {
         group = "build"
-        description = "Extracts aapt2 + java launcher from Termux .deb packages into jniLibs"
+        description = "Extracts aapt2 + java launcher from Termux .deb packages into jniLibs (multi-ABI)"
     }
 
     @TaskAction
     fun prepare() {
         val outRoot = outputDir.get().asFile
-        val abiDir = File(outRoot, "arm64-v8a").apply { mkdirs() }
-
         val cacheDir = File(project.layout.buildDirectory.get().asFile, "native-cache").apply { mkdirs() }
 
-        // Target files (the whole point of this task)
-        val libAapt2 = File(abiDir, "libaapt2.so")
-        val libJava = File(abiDir, "libjava.so")
-        val libJli = File(abiDir, "libjli.so")
+        val abiPackages = packagesByAbi.get()
+        require(abiPackages.isNotEmpty()) { "packagesByAbi is empty — nothing to prepare" }
 
-        // Suffix matchers for TAR entry names. Termux .debs use a single prefix
-        // for all files (either `./data/data/com.termux/files/usr/` or just `./usr/`),
-        // so we match the trailing portion of the path.
-        val suffixMatchers = listOf(
-            "/bin/aapt2" to libAapt2,
-            "/bin/java" to libJava,
-            "/lib/libjli.so" to libJli
-        )
+        for ((abi, urls) in abiPackages) {
+            val abiDir = File(outRoot, abi).apply { mkdirs() }
+            val libAapt2 = File(abiDir, "libaapt2.so")
+            val libJava = File(abiDir, "libjava.so")
+            val libJli = File(abiDir, "libjli.so")
+            // Extra JDK tool launchers. Gradle's AGP plugin invokes jlink during
+            // the JdkImageTransform and javac for cross-SDK java compilation.
+            // Each is a tiny ELF stub (~6KB) that loads libjli.so — we bundle
+            // them all under lib*.so to make the exec-allowed nativeLibraryDir
+            // path available at runtime.
+            val libJlink = File(abiDir, "libjlink.so")
+            val libJavac = File(abiDir, "libjavac.so")
+            val libJar = File(abiDir, "libjar.so")
+            val libJdeps = File(abiDir, "libjdeps.so")
+            val libJmod = File(abiDir, "libjmod.so")
+            val libKeytool = File(abiDir, "libkeytool.so")
 
-        // Extract each package
-        for (url in packageUrls.get()) {
-            val fileName = url.substringAfterLast('/')
-                .substringBefore('?')
-                .substringBeforeLast(".deb") + ".deb"
-            val debFile = File(cacheDir, fileName)
-            if (!debFile.exists() || debFile.length() < 1000) {
-                logger.lifecycle("Downloading $url")
-                debFile.parentFile.mkdirs()
-                URL(url).openStream().use { input ->
-                    FileOutputStream(debFile).use { output ->
-                        input.copyTo(output)
+            val suffixMatchers = listOf(
+                "/bin/aapt2" to libAapt2,
+                "/bin/java" to libJava,
+                "/lib/libjli.so" to libJli,
+                "/bin/jlink" to libJlink,
+                "/bin/javac" to libJavac,
+                "/bin/jar" to libJar,
+                "/bin/jdeps" to libJdeps,
+                "/bin/jmod" to libJmod,
+                "/bin/keytool" to libKeytool
+            )
+
+            for (url in urls) {
+                val fileName = url.substringAfterLast('/')
+                    .substringBefore('?')
+                    .substringBeforeLast(".deb") + ".deb"
+                val debFile = File(cacheDir, fileName)
+                if (!debFile.exists() || debFile.length() < 1000) {
+                    logger.lifecycle("[$abi] Downloading $url")
+                    debFile.parentFile.mkdirs()
+                    URL(url).openStream().use { input ->
+                        FileOutputStream(debFile).use { output ->
+                            input.copyTo(output)
+                        }
                     }
                 }
+                extractDebBinaries(debFile, suffixMatchers)
             }
 
-            // Extract binaries we care about (by path suffix)
-            extractDebBinaries(debFile, suffixMatchers)
-        }
+            // Only aapt2 / java / libjli.so are strictly required. The other JDK
+            // tools (jlink, javac, jar, …) are "nice to have" — if a specific
+            // build of openjdk-17 omits one, the runtime will symlink only the
+            // present ones and fall back to the unbundled binary if Gradle asks.
+            val required = listOf(libAapt2 to "aapt2", libJava to "java", libJli to "libjli.so")
+            val missing = required
+                .filter { !it.first.exists() || it.first.length() < 1000 }
+                .joinToString(", ") { it.second }
+            if (missing.isNotEmpty()) {
+                throw IllegalStateException(
+                    "PrepareNativeBinariesTask[$abi] failed to extract: $missing. " +
+                    "Check the Termux package URLs and contents."
+                )
+            }
 
-        // Verify we got what we need
-        val missing = listOf(libAapt2 to "aapt2", libJava to "java", libJli to "libjli.so")
-            .filter { !it.first.exists() || it.first.length() < 1000 }
-            .joinToString(", ") { it.second }
-        if (missing.isNotEmpty()) {
-            throw IllegalStateException(
-                "PrepareNativeBinariesTask failed to extract: $missing. " +
-                "Check the Termux package URLs and contents."
-            )
-        }
+            val optionalExtracted = listOf(
+                libJlink to "jlink", libJavac to "javac", libJar to "jar",
+                libJdeps to "jdeps", libJmod to "jmod", libKeytool to "keytool"
+            ).filter { it.first.exists() && it.first.length() > 0 }
+                .joinToString(",") { "${it.second}=${it.first.length()}" }
 
-        logger.lifecycle("Native binaries prepared in ${abiDir.absolutePath}")
-        logger.lifecycle("  libaapt2.so: ${libAapt2.length()} bytes")
-        logger.lifecycle("  libjava.so:  ${libJava.length()} bytes")
-        logger.lifecycle("  libjli.so:   ${libJli.length()} bytes")
+            logger.lifecycle("[$abi] core: libaapt2.so=${libAapt2.length()}, " +
+                "libjava.so=${libJava.length()}, libjli.so=${libJli.length()}")
+            if (optionalExtracted.isNotEmpty()) {
+                logger.lifecycle("[$abi] tools: $optionalExtracted")
+            }
+        }
     }
 
     /**

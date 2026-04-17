@@ -26,9 +26,16 @@ class ChunkedDownloader @Inject constructor(
         onProgress: (downloaded: Long, total: Long) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
         try {
-            // Get file size via HEAD request
+            // Get file size via HEAD request. Non-2xx means a 404 error page or
+            // similar — don't cache the response body as the file contents.
             val headRequest = Request.Builder().url(url).head().build()
             val headResponse = baseClient.newCall(headRequest).execute()
+            if (!headResponse.isSuccessful) {
+                headResponse.close()
+                return@withContext Result.failure(Exception(
+                    "HTTP ${headResponse.code} for $url — server returned error, not the expected file"
+                ))
+            }
             val contentLength = headResponse.header("Content-Length")?.toLongOrNull() ?: -1
             val acceptsRanges = headResponse.header("Accept-Ranges") == "bytes"
             headResponse.close()
@@ -106,6 +113,10 @@ class ChunkedDownloader @Inject constructor(
         return try {
             val request = Request.Builder().url(url).build()
             val response = baseClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                response.close()
+                throw Exception("HTTP ${response.code} for $url — server returned an error page, not the expected file")
+            }
             val body = response.body ?: throw Exception("Empty response body")
             val total = body.contentLength()
 
