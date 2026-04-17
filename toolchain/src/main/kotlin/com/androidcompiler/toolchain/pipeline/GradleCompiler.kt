@@ -42,14 +42,31 @@ class GradleCompiler @Inject constructor(
         )
     }
 
+    /** Overrides for the per-compile version selection. Null fields fall back to
+     *  what was detected from projectInfo, then to registry defaults. */
+    data class VersionOverrides(
+        val gradleVersion: String? = null,
+        val compileSdk: Int? = null
+    )
+
     suspend fun compile(
         projectDir: File,
         outputDir: File,
         projectInfo: ProjectAnalyzer.ProjectInfo,
-        onLog: LogCallback
+        onLog: LogCallback,
+        overrides: VersionOverrides = VersionOverrides()
     ): StepResult = withContext(Dispatchers.IO) {
 
         onLog("Detected Gradle project: ${projectInfo.packageName ?: projectDir.name}", ErrorSeverity.INFO)
+
+        // Resolve the effective versions for this compile
+        val effectiveGradleVersion = overrides.gradleVersion
+            ?: projectInfo.requiredGradleVersion
+            ?: registry.defaultGradleVersion
+        val effectiveApiLevel = overrides.compileSdk
+            ?: projectInfo.requiredCompileSdk
+            ?: registry.defaultApiLevel
+        onLog("Using Gradle $effectiveGradleVersion, compileSdk $effectiveApiLevel", ErrorSeverity.INFO)
 
         // Find a working JDK (Termux)
         val javaHome = findJavaHome()
@@ -68,12 +85,13 @@ class GradleCompiler @Inject constructor(
             ))
         }
 
-        val javaBin = File(javaHome, "bin/java")
+        val javaBin = pickJavaBinary(javaHome)
+        val bundledJava = registry.getBundledJavaLauncher() != null && javaBin == registry.getBundledJavaLauncher()
         onLog("JDK: ${javaHome.absolutePath}", ErrorSeverity.INFO)
-        onLog("java: ${javaBin.absolutePath}", ErrorSeverity.INFO)
+        onLog("java: ${javaBin.absolutePath} ${if (bundledJava) "(bundled APK)" else "(downloaded)"}", ErrorSeverity.INFO)
 
-        // Ensure wrapper JAR
-        val wrapperJar = ensureGradleWrapperJar(projectDir, onLog)
+        // Ensure wrapper JAR (version-specific if available, fallback to bundled)
+        val wrapperJar = ensureGradleWrapperJar(projectDir, effectiveGradleVersion, onLog)
         if (wrapperJar == null) {
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
@@ -81,8 +99,8 @@ class GradleCompiler @Inject constructor(
             ))
         }
 
-        // Android SDK
-        val androidSdk = findAndroidSdk()
+        // Android SDK (uses version-specific android.jar if available)
+        val androidSdk = findAndroidSdk(effectiveApiLevel)
         if (androidSdk != null) {
             File(projectDir, "local.properties")
                 .writeText("sdk.dir=${androidSdk.absolutePath.replace("\\", "/")}\n")
@@ -124,10 +142,12 @@ class GradleCompiler @Inject constructor(
         val userHome = File(context.filesDir, "home").apply { mkdirs() }
         File(userHome, ".android").mkdirs()
 
-        // Pre-build verification: check AAPT2 can find its shared libraries
-        val aapt2Bin = registry.getAapt2Binary()
-        if (aapt2Bin.exists()) {
-            onLog("AAPT2: ${aapt2Bin.absolutePath}", ErrorSeverity.INFO)
+        // Pre-build verification: locate AAPT2 and ensure its shared libs are in place
+        val aapt2Bin = pickAapt2Binary()
+        val bundledAapt2 = aapt2Bin != null && aapt2Bin == registry.getBundledAapt2()
+        if (aapt2Bin != null) {
+            onLog("AAPT2: ${aapt2Bin.absolutePath} ${if (bundledAapt2) "(bundled APK)" else "(downloaded)"}",
+                ErrorSeverity.INFO)
             // Ensure shared libs from JDK are available in aapt2-prefix/lib.
             // AAPT2 depends on libc++_shared.so, libz.so.1, etc. which come from
             // Termux's JDK dependencies but aren't in the AAPT2 packages.
@@ -185,32 +205,24 @@ class GradleCompiler @Inject constructor(
             append("--stacktrace")
         }
 
-        // Create a wrapper script for AAPT2 that sets LD_LIBRARY_PATH.
-        // The Termux AAPT2 binary has a hardcoded RPATH pointing to
-        // /data/data/com.termux/files/usr/lib (which doesn't exist), so
-        // LD_LIBRARY_PATH is required. However, AGP starts AAPT2 daemon
-        // via ProcessBuilder and LD_LIBRARY_PATH may not propagate on
-        // Android's linker namespace system. The wrapper ensures it's set.
-        val aapt2Wrapper = File(aapt2Bin.parentFile, "aapt2-wrapper")
-        if (aapt2Bin.exists()) {
+        // AAPT2 wrapper script: only needed when AAPT2 is downloaded (lives in /data/data/)
+        // and we're in a SELinux domain that doesn't propagate LD_LIBRARY_PATH to AGP's
+        // daemon. With the bundled AAPT2 (targetSdk=35), the binary is in nativeLibraryDir
+        // and inherits the parent process's env correctly, so no wrapper is needed.
+        if (!bundledAapt2 && aapt2Bin != null) {
             val realBin = File(aapt2Bin.parentFile, "aapt2-real")
             if (!realBin.exists()) {
-                // First time: rename original binary to aapt2-real
                 aapt2Bin.renameTo(realBin)
             }
-            // (Re)write the wrapper script — it sets LD_LIBRARY_PATH then exec's the real binary
-            // Also logs invocations for debugging
             val logFile = File(context.filesDir, "aapt2_wrapper.log")
             aapt2Bin.writeText("""#!/system/bin/sh
 echo "AAPT2 wrapper invoked: ${'$'}@" >> '${logFile.absolutePath}'
-echo "LD_LIBRARY_PATH before: ${'$'}LD_LIBRARY_PATH" >> '${logFile.absolutePath}'
 export LD_LIBRARY_PATH='${aapt2LibDir.absolutePath}:${File(jdkInstaller.jdkDir, "lib").absolutePath}:${File(javaHome, "lib").absolutePath}'
-echo "LD_LIBRARY_PATH after: ${'$'}LD_LIBRARY_PATH" >> '${logFile.absolutePath}'
 exec '${realBin.absolutePath}' "${'$'}@"
 """)
             aapt2Bin.setExecutable(true, false)
             aapt2Bin.setReadable(true, false)
-            onLog("AAPT2 wrapper created with LD_LIBRARY_PATH", ErrorSeverity.INFO)
+            onLog("AAPT2 wrapper created (legacy path)", ErrorSeverity.INFO)
         }
 
         // Execute via /system/bin/sh which is on an exec-mounted partition.
@@ -221,7 +233,27 @@ exec '${realBin.absolutePath}' "${'$'}@"
         onLog("Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
         onLog("LD_LIBRARY_PATH: $ldPath", ErrorSeverity.INFO)
 
-        val result = executeGradleBuild(command, projectDir, onLog)
+        var result = executeGradleBuild(command, projectDir, onLog)
+
+        // If Gradle failed resolving its own classpath (typically kspClasspath after
+        // a wiped cache from pm clear), nuke the modules cache and retry once.
+        // The cache sits at gradle_home/caches/modules-2 and can be left in a
+        // partially-populated state if a download was interrupted.
+        if (result.exitCode != 0 && shouldRetryWithCacheReset(result)) {
+            onLog(
+                "Gradle dependency cache appears corrupted (${detectResolutionFailure(result)}). " +
+                "Clearing caches/modules-2 and retrying once...",
+                ErrorSeverity.WARNING
+            )
+            try {
+                File(gradleHome, "caches/modules-2").deleteRecursively()
+                File(gradleHome, "caches/transforms-4").deleteRecursively()
+                File(gradleHome, "caches/jars-9").deleteRecursively()
+            } catch (e: Exception) {
+                onLog("Cache cleanup failed: ${e.message}", ErrorSeverity.WARNING)
+            }
+            result = executeGradleBuild(command, projectDir, onLog)
+        }
 
         // Write full build output to persistent location for debugging
         try {
@@ -254,10 +286,18 @@ exec '${realBin.absolutePath}' "${'$'}@"
         StepResult.Success(listOf(outputApk))
     }
 
+    /**
+     * Locates a usable JAVA_HOME directory.
+     *
+     * Returns the downloaded-JDK root in filesDir/toolchain/jdk17/lib/jvm/java-17-openjdk/,
+     * regardless of whether we'll use the bundled launcher (from APK) or the launcher
+     * inside that JDK. The java launcher uses JAVA_HOME to locate modules/, lib/server/libjvm.so,
+     * etc. The actual `java` binary we exec is selected by [pickJavaBinary].
+     */
     private fun findJavaHome(): File? {
         // Priority 1: Bundled JDK (downloaded from Termux repo by AndroidCompiler)
         val bundledJdk = jdkInstaller.getJavaHome() ?: registry.getJavaHome()
-        if (bundledJdk != null && File(bundledJdk, "bin/java").exists()) return bundledJdk
+        if (bundledJdk != null && bundledJdk.exists()) return bundledJdk
 
         // Priority 2: Termux installed JDK (if user has Termux)
         for (path in TERMUX_JDK_PATHS) {
@@ -280,7 +320,63 @@ exec '${realBin.absolutePath}' "${'$'}@"
         return null
     }
 
-    private fun findAndroidSdk(): File? {
+    /**
+     * Picks which `java` executable to run. Prefers the APK-bundled launcher because
+     * it lives in nativeLibraryDir which is exec-allowed on all targetSdk levels.
+     * Falls back to the downloaded JDK's bin/java which only works when the app is
+     * in untrusted_app_29 or earlier (targetSdk ≤ 28).
+     */
+    private fun pickJavaBinary(javaHome: File): File {
+        registry.getBundledJavaLauncher()?.let { bundled ->
+            if (bundled.exists() && bundled.canExecute()) return bundled
+        }
+        return File(javaHome, "bin/java")
+    }
+
+    /**
+     * Resolves which `android.jar` file to use for a requested API level.
+     * Checks (in order):
+     *   1. The version-specific variant at toolchain/android-jar-variants/android-N.jar
+     *   2. An installed variant at a lower API level (graceful degradation)
+     *   3. An installed variant at a higher API level
+     *   4. The legacy single toolchain/android.jar
+     */
+    private fun resolveAndroidJarForApi(requestedApi: Int): File? {
+        registry.androidJarForApi(requestedApi).takeIf { it.exists() && it.length() > 0 }?.let { return it }
+        val installed = registry.installedApiLevels()
+        installed.filter { it <= requestedApi }.maxOrNull()?.let {
+            return registry.androidJarForApi(it)
+        }
+        installed.minOrNull()?.let { return registry.androidJarForApi(it) }
+        return registry.getAndroidJar().takeIf { it.exists() && it.length() > 0 }
+    }
+
+    /**
+     * Returns the API level number that will actually back the SDK we hand to
+     * AGP. Always a number — even when we're falling back to a lower API jar.
+     */
+    private fun resolveInstalledApiLevelForRequest(requestedApi: Int): Int {
+        if (registry.androidJarForApi(requestedApi).let { it.exists() && it.length() > 0 }) {
+            return requestedApi
+        }
+        val installed = registry.installedApiLevels()
+        installed.filter { it <= requestedApi }.maxOrNull()?.let { return it }
+        installed.minOrNull()?.let { return it }
+        return requestedApi // no variants installed — use requested for the stub props
+    }
+
+    /**
+     * Picks which AAPT2 binary to use. Same logic as [pickJavaBinary] — bundled first.
+     */
+    private fun pickAapt2Binary(): File? {
+        registry.getBundledAapt2()?.let { bundled ->
+            if (bundled.exists() && bundled.canExecute()) return bundled
+        }
+        val downloaded = registry.getAapt2Binary()
+        return if (downloaded.exists()) downloaded else null
+    }
+
+    private fun findAndroidSdk(requestedApi: Int = registry.defaultApiLevel): File? {
         // Priority 1: Real SDK from environment or Termux
         listOfNotNull(
             System.getenv("ANDROID_HOME"),
@@ -289,62 +385,73 @@ exec '${realBin.absolutePath}' "${'$'}@"
         ).map { File(it) }.firstOrNull { it.exists() && File(it, "platforms").exists() }
             ?.let { return it }
 
-        // Priority 2: Create minimal SDK from our bundled android.jar
-        val androidJar = registry.getAndroidJar()
-        if (androidJar.exists()) {
+        // Priority 2: Create minimal SDK from a version-specific android.jar.
+        // Prefer the variant for the requested API, then fall back through
+        // installed variants, then the legacy single android.jar.
+        val androidJar = resolveAndroidJarForApi(requestedApi)
+        val resolvedApi = resolveInstalledApiLevelForRequest(requestedApi)
+        if (androidJar != null && androidJar.exists()) {
             val sdkRoot = File(context.filesDir, "android-sdk")
             // Remove any stale build-tools stub that would cause AGP to report "corrupted"
             File(sdkRoot, "build-tools").let { if (it.exists()) it.deleteRecursively() }
-            // Create platform dirs for multiple possible names AGP might look for.
-            // Provide both API 34 and 35 platform dirs (our android.jar is API 34
-            // which AAPT2 v2.19 can parse; API 35's resources.arsc uses a newer format).
-            for (suffix in listOf("android-34", "android-34-ext7", "android-35", "android-35-2", "android-35-ext14")) {
+            // Create platform dirs covering every name AGP might look for at
+            // the requested API level, plus a couple of adjacent extension-level
+            // variants as a safety net. We key the contents off [resolvedApi].
+            val cfsmForResolved = registry.coreForSystemModulesForApi(resolvedApi)
+                .takeIf { it.exists() }
+                ?: File(registry.toolchainDir, "core-for-system-modules.jar").takeIf { it.exists() }
+            val platformSuffixes = buildSet {
+                add("android-$resolvedApi")
+                add("android-$resolvedApi-2")
+                add("android-$resolvedApi-ext7")
+                add("android-$resolvedApi-ext14")
+                // Also cover the originally requested API if different, so AGP
+                // finds the dir it looks for even when our fallback used a lower API.
+                add("android-$requestedApi")
+                add("android-$requestedApi-2")
+            }
+            for (suffix in platformSuffixes) {
                 val platformDir = File(sdkRoot, "platforms/$suffix")
                 platformDir.mkdirs()
                 val targetJar = File(platformDir, "android.jar")
                 if (!targetJar.exists() || targetJar.length() != androidJar.length()) {
                     androidJar.copyTo(targetJar, overwrite = true)
                 }
-                // Ensure android.jar is readable by all (AAPT2 daemon runs as same user
-                // but explicit perms avoid SELinux surprises)
                 targetJar.setReadable(true, false)
                 targetJar.setWritable(false, false)
-                // core-for-system-modules.jar — needed by AGP for Java compilation.
-                // Extracted alongside android.jar from the platform ZIP.
+
                 val cfsm = File(platformDir, "core-for-system-modules.jar")
-                val cfsmSource = File(registry.toolchainDir, "core-for-system-modules.jar")
-                if (cfsmSource.exists() && (!cfsm.exists() || cfsm.length() != cfsmSource.length())) {
-                    cfsmSource.copyTo(cfsm, overwrite = true)
+                if (cfsmForResolved != null &&
+                    (!cfsm.exists() || cfsm.length() != cfsmForResolved.length())) {
+                    cfsmForResolved.copyTo(cfsm, overwrite = true)
                 } else if (!cfsm.exists()) {
-                    // Fallback: empty JAR if not extracted from platform ZIP
                     cfsm.writeBytes(createEmptyJar())
                 }
-                // framework.aidl — needed by AGP for AIDL compilation
+
                 val fwAidl = File(platformDir, "framework.aidl")
                 if (!fwAidl.exists()) fwAidl.writeText("// stub\n")
-                // AGP also looks for build.prop and source.properties — create stubs
                 File(platformDir, "build.prop").apply {
                     if (!exists()) writeText(
-                        "ro.build.version.sdk=35\n" +
+                        "ro.build.version.sdk=$resolvedApi\n" +
                         "ro.build.version.codename=REL\n"
                     )
                 }
                 File(platformDir, "source.properties").apply {
                     if (!exists()) writeText(
-                        "Pkg.Desc=Android SDK Platform 35\n" +
+                        "Pkg.Desc=Android SDK Platform $resolvedApi\n" +
                         "Pkg.Revision=1\n" +
-                        "AndroidVersion.ApiLevel=35\n" +
+                        "AndroidVersion.ApiLevel=$resolvedApi\n" +
                         "Layoutlib.Api=15\n" +
                         "Layoutlib.Revision=1\n"
                     )
                 }
             }
-            // Create build-tools with our ARM64 AAPT2 wrapper.
+            // Create build-tools with our ARM64 AAPT2.
             // AGP validates build-tools by checking for aapt, aapt2, dx, and other tools.
-            // We provide our wrapper for aapt2 and stub scripts for tools AGP checks but
+            // We provide our binary for aapt2 and stub scripts for tools AGP checks but
             // doesn't actually invoke during modern builds.
-            val aapt2Src = registry.getAapt2Binary()
-            if (aapt2Src.exists()) {
+            val aapt2Src = pickAapt2Binary()
+            if (aapt2Src != null && aapt2Src.exists()) {
                 val btDir = File(sdkRoot, "build-tools/35.0.0")
                 btDir.mkdirs()
                 File(btDir, "source.properties").writeText(
@@ -434,9 +541,11 @@ exec '${realBin.absolutePath}' "${'$'}@"
             val tmpDir = File(context.cacheDir, "tmp").absolutePath
             val userHome = File(context.filesDir, "home").absolutePath
             appendLine("org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8 -Djava.io.tmpdir=$tmpDir -Duser.home=$userHome -Djdk.lang.Process.launchMechanism=FORK -Djava.library.path=$jdkVmLib:$jdkLibDir")
-            // Use our bundled ARM64 AAPT2 instead of AGP's x86_64 Linux binary
-            val aapt2 = registry.getAapt2Binary()
-            if (aapt2.exists()) {
+            // Use our ARM64 AAPT2 instead of AGP's x86_64 Linux binary.
+            // Prefer the bundled (nativeLibraryDir) binary — exec-allowed in every
+            // targetSdk. Fall back to the downloaded one for legacy installs.
+            val aapt2 = pickAapt2Binary()
+            if (aapt2 != null && aapt2.exists()) {
                 appendLine("android.aapt2FromMavenOverride=${aapt2.absolutePath}")
             }
         }
@@ -444,24 +553,42 @@ exec '${realBin.absolutePath}' "${'$'}@"
         onLog("Gradle properties configured", ErrorSeverity.INFO)
     }
 
-    private fun ensureGradleWrapperJar(projectDir: File, onLog: LogCallback): File? {
+    private fun ensureGradleWrapperJar(
+        projectDir: File,
+        targetGradleVersion: String,
+        onLog: LogCallback
+    ): File? {
         val wrapperDir = File(projectDir, "gradle/wrapper").apply { mkdirs() }
         val wrapperJar = File(wrapperDir, "gradle-wrapper.jar")
         val wrapperProps = File(wrapperDir, "gradle-wrapper.properties")
 
+        // Always rewrite gradle-wrapper.properties so the target version matches
+        // (the project may ship one pointing at a version we don't have locally).
+        rewriteWrapperProperties(wrapperProps, targetGradleVersion)
+
+        // Existing wrapper jar in the project takes priority — it's already
+        // matched to some Gradle version that works.
         if (wrapperJar.exists() && wrapperJar.length() > 1000) {
-            ensureWrapperProperties(wrapperProps)
             return wrapperJar
         }
 
+        // 1. Version-specific downloaded wrapper
+        val versionedJar = registry.gradleWrapperJarFor(targetGradleVersion)
+        if (versionedJar.exists() && versionedJar.length() > 1000) {
+            versionedJar.copyTo(wrapperJar, overwrite = true)
+            onLog("Injected gradle-wrapper.jar for Gradle $targetGradleVersion", ErrorSeverity.INFO)
+            return wrapperJar
+        }
+
+        // 2. Generic toolchain-level wrapper (the default bundled one)
         val toolchainJar = File(registry.toolchainDir, "gradle-wrapper.jar")
         if (toolchainJar.exists() && toolchainJar.length() > 1000) {
             toolchainJar.copyTo(wrapperJar, overwrite = true)
-            onLog("Injected gradle-wrapper.jar from toolchain", ErrorSeverity.INFO)
-            ensureWrapperProperties(wrapperProps)
+            onLog("Injected gradle-wrapper.jar from toolchain (default)", ErrorSeverity.INFO)
             return wrapperJar
         }
 
+        // 3. Walk any existing Gradle caches for a working wrapper jar
         for (cache in listOf(
             File(context.filesDir, "gradle_home/wrapper/dists"),
             File(System.getProperty("user.home", "/data"), ".gradle/wrapper/dists")
@@ -472,7 +599,6 @@ exec '${realBin.absolutePath}' "${'$'}@"
                     .firstOrNull()
                     ?.let {
                         it.copyTo(wrapperJar, overwrite = true)
-                        ensureWrapperProperties(wrapperProps)
                         return wrapperJar
                     }
             }
@@ -480,12 +606,12 @@ exec '${realBin.absolutePath}' "${'$'}@"
         return null
     }
 
-    private fun ensureWrapperProperties(propsFile: File) {
-        if (propsFile.exists()) return
+    private fun rewriteWrapperProperties(propsFile: File, version: String) {
+        propsFile.parentFile?.mkdirs()
         propsFile.writeText("""
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
-distributionUrl=https\://services.gradle.org/distributions/gradle-$GRADLE_WRAPPER_VERSION-bin.zip
+distributionUrl=https\://services.gradle.org/distributions/gradle-$version-bin.zip
 networkTimeout=10000
 validateDistributionUrl=true
 zipStoreBase=GRADLE_USER_HOME
@@ -569,6 +695,38 @@ zipStorePath=wrapper/dists
         return projectDir.walkTopDown()
             .filter { it.extension == "apk" && it.path.contains("outputs") && !it.name.contains("unsigned") }
             .maxByOrNull { it.lastModified() }
+    }
+
+    /**
+     * Detects the "Could not resolve all files for configuration" family of errors
+     * that indicate a corrupted or incomplete Gradle modules cache. Typically
+     * triggered by a wiped caches/modules-2 after `pm clear` where the subsequent
+     * dependency download was interrupted.
+     */
+    private fun shouldRetryWithCacheReset(result: ProcessResult): Boolean {
+        if (result.exitCode == 0) return false
+        val output = result.stdout + result.stderr
+        return output.contains("Could not resolve all files for configuration") ||
+                output.contains("Could not resolve all artifacts for configuration") ||
+                output.contains("Could not resolve all dependencies for configuration") ||
+                output.contains("kspClasspath") ||
+                output.contains("Could not find org.jetbrains.kotlin") ||
+                output.contains("Could not find com.google.devtools.ksp") ||
+                output.contains("Could not GET ") ||
+                output.contains("PKIX path validation failed")
+    }
+
+    /** Produces a short human-readable tag for why we're retrying. */
+    private fun detectResolutionFailure(result: ProcessResult): String {
+        val output = result.stdout + result.stderr
+        return when {
+            output.contains("kspClasspath") -> "kspClasspath resolution failed"
+            output.contains("Could not resolve all files") -> "could not resolve all files"
+            output.contains("Could not resolve all artifacts") -> "could not resolve all artifacts"
+            output.contains("PKIX path validation failed") -> "TLS validation failed mid-download"
+            output.contains("Could not GET ") -> "HTTP GET failed mid-resolution"
+            else -> "dependency resolution failed"
+        }
     }
 
     /** Creates a minimal valid JAR file (just the manifest) */

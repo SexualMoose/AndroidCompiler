@@ -17,6 +17,8 @@ dependencies {
     compileOnly(libs.android.gradlePlugin)
     compileOnly(libs.kotlin.gradlePlugin)
     compileOnly(libs.compose.gradlePlugin)
+    // XZ decompression for PrepareNativeBinariesTask (Termux .debs use tar.xz)
+    implementation(libs.xz)
 }
 
 gradlePlugin {
@@ -36,6 +38,10 @@ gradlePlugin {
         register("androidHilt") {
             id = "androidcompiler.android.hilt"
             implementationClass = "AndroidHiltConventionPlugin"
+        }
+        register("androidNativeBinaries") {
+            id = "androidcompiler.native.binaries"
+            implementationClass = "AndroidNativeBinariesConventionPlugin"
         }
     }
 }

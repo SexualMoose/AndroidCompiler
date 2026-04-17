@@ -48,6 +48,7 @@ class CompilationPipeline @Inject constructor(
         zipPath: String,
         outputDir: File,
         incrementalFileNames: Boolean = true,
+        overrides: GradleCompiler.VersionOverrides = GradleCompiler.VersionOverrides(),
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult = withContext(Dispatchers.Default) {
@@ -86,7 +87,7 @@ class CompilationPipeline @Inject constructor(
         val result = when (projectInfo.type) {
             ProjectAnalyzer.ProjectType.GRADLE_PROJECT -> {
                 onLog("Using Gradle build system (full project with dependencies)", ErrorSeverity.INFO)
-                compileWithGradle(projectDir, outputDir, projectInfo, onProgress, onLog)
+                compileWithGradle(projectDir, outputDir, projectInfo, overrides, onProgress, onLog)
             }
             ProjectAnalyzer.ProjectType.SIMPLE_PROJECT -> {
                 if (!registry.isAllInstalled()) {
@@ -122,13 +123,14 @@ class CompilationPipeline @Inject constructor(
         projectDir: File,
         outputDir: File,
         projectInfo: ProjectAnalyzer.ProjectInfo,
+        overrides: GradleCompiler.VersionOverrides,
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult {
         onProgress(CompilationStep.COMPILING_SOURCES, 0f)
         onLog("Starting Gradle build...", ErrorSeverity.INFO)
 
-        val result = gradleCompiler.compile(projectDir, outputDir, projectInfo, onLog)
+        val result = gradleCompiler.compile(projectDir, outputDir, projectInfo, onLog, overrides)
 
         return when (result) {
             is StepResult.Success -> {

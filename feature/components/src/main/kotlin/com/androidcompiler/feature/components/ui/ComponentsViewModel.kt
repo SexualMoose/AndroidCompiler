@@ -1,5 +1,6 @@
 package com.androidcompiler.feature.components.ui
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.androidcompiler.core.common.model.ComponentStatus
@@ -7,15 +8,20 @@ import com.androidcompiler.core.common.model.ToolchainComponent
 import com.androidcompiler.toolchain.download.ComponentDownloadManager
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import javax.inject.Inject
 
 @HiltViewModel
 class ComponentsViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val registry: ToolchainRegistry,
     private val downloadManager: ComponentDownloadManager
 ) : ViewModel() {
@@ -25,6 +31,12 @@ class ComponentsViewModel @Inject constructor(
 
     private val _isDownloadingAll = MutableStateFlow(false)
     val isDownloadingAll: StateFlow<Boolean> = _isDownloadingAll.asStateFlow()
+
+    private val _cacheMessage = MutableStateFlow<String?>(null)
+    val cacheMessage: StateFlow<String?> = _cacheMessage.asStateFlow()
+
+    private val _isClearingCache = MutableStateFlow(false)
+    val isClearingCache: StateFlow<Boolean> = _isClearingCache.asStateFlow()
 
     init {
         refreshAll()
@@ -84,5 +96,36 @@ class ComponentsViewModel @Inject constructor(
                 else component to currentStatus
             }
         }
+    }
+
+    /**
+     * Clears Gradle's dependency and wrapper caches. Useful after pm clear or when
+     * kspClasspath / dependency resolution fails due to a corrupt cache state.
+     * Does NOT delete the toolchain (JDK, AAPT2, android.jar) — just the Gradle
+     * caches populated during a compile.
+     */
+    fun clearGradleCache() {
+        if (_isClearingCache.value) return
+        _isClearingCache.value = true
+        _cacheMessage.value = "Clearing Gradle cache..."
+        viewModelScope.launch {
+            val bytesFreed = withContext(Dispatchers.IO) {
+                val gradleHome = File(context.filesDir, "gradle_home")
+                if (!gradleHome.exists()) return@withContext 0L
+                val before = gradleHome.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                for (sub in listOf("caches", "wrapper", "daemon", "notifications")) {
+                    try { File(gradleHome, sub).deleteRecursively() } catch (_: Exception) { }
+                }
+                val after = gradleHome.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                before - after
+            }
+            val mb = bytesFreed / 1_048_576.0
+            _cacheMessage.value = "Cleared %.1f MB. Next compile will redownload dependencies.".format(mb)
+            _isClearingCache.value = false
+        }
+    }
+
+    fun dismissCacheMessage() {
+        _cacheMessage.value = null
     }
 }

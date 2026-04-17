@@ -405,27 +405,58 @@ class ComponentDownloadManager @Inject constructor(
     }
 
     private fun extractAndroidJar(zipFile: File, targetFile: File) {
+        // Validate this is actually a ZIP — a 404 HTML response would silently
+        // pass through ZipInputStream as "no entries" and confuse the user.
+        FileInputStream(zipFile).use { input ->
+            val magic = ByteArray(4)
+            if (input.read(magic) != 4) {
+                throw Exception("Downloaded file is empty or too small to be a ZIP (${zipFile.length()} bytes)")
+            }
+            // Local file header magic: 0x04034b50 (little-endian) → "PK\x03\x04"
+            // Empty ZIP can also start with central directory magic "PK\x05\x06"
+            val isZip = magic[0] == 0x50.toByte() && magic[1] == 0x4B.toByte() &&
+                    (magic[2] == 0x03.toByte() || magic[2] == 0x05.toByte() || magic[2] == 0x07.toByte())
+            if (!isZip) {
+                val preview = magic.joinToString(" ") { "0x%02X".format(it) }
+                throw Exception(
+                    "Downloaded file is not a valid ZIP (magic bytes: $preview). " +
+                    "This usually means the URL returned an error page instead of the file."
+                )
+            }
+        }
+
         // Extract android.jar and core-for-system-modules.jar from the platform ZIP
         val coreModulesTarget = File(targetFile.parentFile, "core-for-system-modules.jar")
         var foundAndroidJar = false
 
-        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                when {
-                    entry.name.endsWith("android.jar") -> {
-                        targetFile.outputStream().use { out -> zis.copyTo(out) }
-                        foundAndroidJar = true
+        try {
+            ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    when {
+                        entry.name.endsWith("android.jar") -> {
+                            targetFile.outputStream().use { out -> zis.copyTo(out) }
+                            foundAndroidJar = true
+                        }
+                        entry.name.endsWith("core-for-system-modules.jar") -> {
+                            coreModulesTarget.outputStream().use { out -> zis.copyTo(out) }
+                        }
                     }
-                    entry.name.endsWith("core-for-system-modules.jar") -> {
-                        coreModulesTarget.outputStream().use { out -> zis.copyTo(out) }
-                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
                 }
-                zis.closeEntry()
-                entry = zis.nextEntry
             }
+        } catch (e: Exception) {
+            // Clean up any partial writes so the next retry starts fresh
+            if (targetFile.exists() && !foundAndroidJar) targetFile.delete()
+            throw e
         }
-        if (!foundAndroidJar) throw Exception("android.jar not found in SDK platform ZIP")
+
+        if (!foundAndroidJar) {
+            // Delete whatever partial file may have been produced
+            if (targetFile.exists()) targetFile.delete()
+            throw Exception("android.jar not found in SDK platform ZIP")
+        }
     }
 
     private fun extractAapt2FromJar(jarFile: File, targetFile: File) {
@@ -599,5 +630,124 @@ class ComponentDownloadManager @Inject constructor(
                 onComponentComplete(component.id, false, result.exceptionOrNull()?.message)
             }
         }
+    }
+
+    /**
+     * Downloads the android.jar (and core-for-system-modules.jar) for a specific
+     * API level into the android-jar-variants directory. Returns Result.success
+     * with the android.jar file.
+     */
+    suspend fun downloadAndroidJarForApi(
+        apiLevel: Int,
+        onProgress: (Float) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val target = registry.androidJarForApi(apiLevel)
+        if (target.exists() && target.length() > 0) return@withContext Result.success(target)
+
+        val url = try { registry.platformZipUrl(apiLevel) }
+        catch (e: Exception) { return@withContext Result.failure(e) }
+
+        val tempZip = File(context.cacheDir, "platform-${apiLevel}.zip")
+        try {
+            val result = chunkedDownloader.download(
+                url = url,
+                outputFile = tempZip,
+                onProgress = { d, t -> if (t > 0) onProgress(d.toFloat() / t) }
+            )
+            result.getOrThrow()
+            // Extract android.jar and core-for-system-modules.jar to variant dir
+            target.parentFile?.mkdirs()
+            val coreTarget = registry.coreForSystemModulesForApi(apiLevel)
+            extractAndroidJarToVariantDir(tempZip, target, coreTarget)
+            Result.success(target)
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            tempZip.delete()
+        }
+    }
+
+    /**
+     * Downloads a specific Gradle distribution zip into gradle-dists/ and extracts
+     * gradle-wrapper.jar for that version.
+     */
+    suspend fun downloadGradleDistribution(
+        version: String,
+        onProgress: (Float) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val target = registry.gradleDistZip(version)
+        if (target.exists() && target.length() > 0) return@withContext Result.success(target)
+
+        val url = registry.gradleDistributionUrl(version)
+        target.parentFile?.mkdirs()
+        try {
+            val result = chunkedDownloader.download(
+                url = url,
+                outputFile = target,
+                onProgress = { d, t -> if (t > 0) onProgress(d.toFloat() / t) }
+            )
+            result.getOrThrow()
+            extractGradleWrapperJar(target, registry.gradleWrapperJarFor(version))
+            Result.success(target)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Extracts android.jar and core-for-system-modules.jar from a platform ZIP. */
+    private fun extractAndroidJarToVariantDir(zipFile: File, androidJarOut: File, coreJarOut: File) {
+        FileInputStream(zipFile).use { input ->
+            val magic = ByteArray(4)
+            if (input.read(magic) != 4 ||
+                magic[0] != 0x50.toByte() || magic[1] != 0x4B.toByte()) {
+                throw Exception("Downloaded file is not a valid ZIP (magic check failed)")
+            }
+        }
+        var foundAndroidJar = false
+        try {
+            ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    when {
+                        entry.name.endsWith("android.jar") -> {
+                            androidJarOut.outputStream().use { out -> zis.copyTo(out) }
+                            foundAndroidJar = true
+                        }
+                        entry.name.endsWith("core-for-system-modules.jar") -> {
+                            coreJarOut.outputStream().use { out -> zis.copyTo(out) }
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+        } catch (e: Exception) {
+            if (androidJarOut.exists() && !foundAndroidJar) androidJarOut.delete()
+            throw e
+        }
+        if (!foundAndroidJar) {
+            if (androidJarOut.exists()) androidJarOut.delete()
+            throw Exception("android.jar not found in platform ZIP for API")
+        }
+    }
+
+    /** Extracts gradle-wrapper.jar from a gradle-X.X-bin.zip distribution. */
+    private fun extractGradleWrapperJar(distZip: File, wrapperJarOut: File) {
+        ZipInputStream(distZip.inputStream().buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                if (entry.name.endsWith("/lib/gradle-wrapper.jar") ||
+                    entry.name.endsWith("/lib/plugins/gradle-wrapper-main-plugin.jar") ||
+                    entry.name.endsWith("gradle-wrapper.jar")) {
+                    wrapperJarOut.parentFile?.mkdirs()
+                    wrapperJarOut.outputStream().use { out -> zis.copyTo(out) }
+                    return
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+        // Gradle distributions don't always ship gradle-wrapper.jar directly;
+        // we fall back to the bundled default wrapper if this fails. Not a hard error.
     }
 }

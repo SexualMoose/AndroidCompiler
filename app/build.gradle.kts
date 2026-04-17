@@ -5,6 +5,19 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt)
     alias(libs.plugins.ksp)
+    // Downloads Termux .debs and extracts aapt2 + java launcher into jniLibs.
+    // The resulting files are lib*.so so Android's installer places them in
+    // nativeLibraryDir (exec-allowed on all targetSdk levels).
+    id("androidcompiler.native.binaries")
+}
+
+nativeBinaries {
+    packageUrls.set(listOf(
+        // AAPT2 (Android Asset Packaging Tool v2) — ARM64, build tools 13.0.0.6
+        "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
+        // OpenJDK 17 — ships the `java` launcher and libjli.so
+        "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb"
+    ))
 }
 
 android {
@@ -14,15 +27,23 @@ android {
     defaultConfig {
         applicationId = "com.androidcompiler"
         minSdk = 28
-        targetSdk = 28 // Must be <=28 to run in untrusted_app_29 SELinux domain
-                       // which allows executing binaries from app data directory.
-                       // Android 15's untrusted_app (targetSdk 33+) blocks all exec
-                       // from app_data_file. This is how Termux works too.
-        versionCode = 1
-        versionName = "1.0.0"
+        // Modern targetSdk — Android 15. We no longer rely on SELinux loopholes
+        // in older domains because executable binaries (aapt2, java) now ship
+        // bundled in the APK's native library dir, which is exec-allowed for
+        // every targetSdk. See app/src/main/jniLibs/arm64-v8a/lib*.so.
+        targetSdk = 35
+        versionCode = 2
+        versionName = "1.1.0"
+
+        // Only build ARM64 binaries — that's the only ABI we target.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+
+    // jniLibs source dir is wired by the androidcompiler.native.binaries plugin
 
     buildTypes {
         release {
@@ -46,6 +67,21 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        jniLibs {
+            // CRITICAL: Keep bundled binaries uncompressed so Android extracts them
+            // directly to nativeLibraryDir (which is exec-allowed). With the default
+            // compression, they'd get re-extracted to app_data_file at runtime and
+            // fail SELinux exec checks.
+            useLegacyPackaging = true
+            // Don't let AGP strip these "libraries" — they're actually binaries
+            // and their entry points aren't standard .so exports.
+            keepDebugSymbols += "**/libaapt2.so"
+            keepDebugSymbols += "**/libjava.so"
+            keepDebugSymbols += "**/libjli.so"
+        }
     }
 }
 
