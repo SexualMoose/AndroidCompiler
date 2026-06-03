@@ -3,7 +3,10 @@
 /local.properties
 /.idea
 .DS_Store
-/build
+# Ignore every module's build output, not just the root. This is a multi-module
+# project (app, core/*, feature/*, network, toolchain, build-logic/convention),
+# so a leading-slash "/build" would leave the per-module build/ dirs untracked.
+build/
 /captures
 .externalNativeBuild
 .cxx

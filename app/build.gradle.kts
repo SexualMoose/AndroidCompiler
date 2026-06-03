@@ -16,14 +16,20 @@ nativeBinaries {
     // arm64-v8a covers every modern phone (S26 Ultra, etc.); x86_64 covers
     // Chromebooks, Windows Subsystem for Android, and the stock Android Studio
     // emulator for iterative development.
+    // These are the PINNED versions. They're a starting point, not a hard
+    // requirement: Termux's pool keeps only the latest patch of each package, so
+    // a pinned URL 404s after a bump. The prepareNativeBinaries task self-heals by
+    // (1) seeding committed prebuilts from prebuilts/native-jniLibs/ first, and
+    // (2) if a pinned URL fails, resolving the current .deb from the pool listing.
+    // Bump these when convenient, but the build no longer breaks if they go stale.
     packagesByAbi.set(mapOf(
         "arm64-v8a" to listOf(
             "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
-            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_aarch64.deb"
+            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.19_aarch64.deb"
         ),
         "x86_64" to listOf(
             "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_x86_64.deb",
-            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.18_x86_64.deb"
+            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.19_x86_64.deb"
         )
     ))
 }

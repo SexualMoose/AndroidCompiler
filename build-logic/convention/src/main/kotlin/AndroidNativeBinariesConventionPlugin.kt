@@ -23,9 +23,17 @@ class AndroidNativeBinariesConventionPlugin : Plugin<Project> {
         with(target) {
             val ext = extensions.create("nativeBinaries", NativeBinariesExtension::class.java)
 
+            // Offline-first: committed prebuilt launcher binaries, laid out as
+            // <rootProject>/prebuilts/native-jniLibs/<abi>/lib*.so. Seeded into the
+            // task output before any network access so a fresh clone builds even
+            // when Termux is unreachable or has rotated its package versions. A
+            // fileTree of a missing dir is simply empty (no error).
+            val prebuilts = rootProject.fileTree("prebuilts/native-jniLibs")
+
             val prepareTask = tasks.register<PrepareNativeBinariesTask>("prepareNativeBinaries") {
                 outputDir.set(layout.buildDirectory.dir("generated/native-jniLibs"))
                 packagesByAbi.set(ext.packagesByAbi)
+                prebuiltFiles.from(prebuilts)
             }
 
             // Wire the generated output into jniLibs source dirs.

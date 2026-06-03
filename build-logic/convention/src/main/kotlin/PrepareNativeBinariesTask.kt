@@ -1,16 +1,21 @@
 import org.gradle.api.DefaultTask
+import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.ListProperty
 import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.URL
+import java.net.URI
 
 /**
  * Downloads Termux's ARM64 aapt2 and openjdk-17 .deb packages, extracts the two
@@ -43,6 +48,19 @@ abstract class PrepareNativeBinariesTask : DefaultTask() {
      */
     @get:Input
     abstract val packagesByAbi: org.gradle.api.provider.MapProperty<String, List<String>>
+
+    /**
+     * Committed prebuilt launcher binaries laid out as `<abi>/lib*.so` (wired by
+     * the convention plugin from `<rootProject>/prebuilts/native-jniLibs`). These
+     * are seeded into the output BEFORE any network access — the offline-first
+     * hardening so a fresh clone builds even when Termux is unreachable or has
+     * rotated its package versions. Optional: if empty, the task downloads
+     * everything from Termux as before.
+     */
+    @get:InputFiles
+    @get:Optional
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val prebuiltFiles: ConfigurableFileCollection
 
     init {
         group = "build"
@@ -86,21 +104,28 @@ abstract class PrepareNativeBinariesTask : DefaultTask() {
                 "/bin/keytool" to libKeytool
             )
 
-            for (url in urls) {
-                val fileName = url.substringAfterLast('/')
-                    .substringBefore('?')
-                    .substringBeforeLast(".deb") + ".deb"
-                val debFile = File(cacheDir, fileName)
-                if (!debFile.exists() || debFile.length() < 1000) {
-                    logger.lifecycle("[$abi] Downloading $url")
-                    debFile.parentFile.mkdirs()
-                    URL(url).openStream().use { input ->
-                        FileOutputStream(debFile).use { output ->
-                            input.copyTo(output)
-                        }
+            // Offline-first hardening: seed any committed prebuilt binaries for
+            // this ABI before touching the network. A fresh clone with prebuilts
+            // present never needs Termux at all.
+            seedFromPrebuilts(abi, abiDir)
+
+            // Only reach out to Termux for binaries the prebuilts didn't supply.
+            val allTargets = suffixMatchers.map { it.second }
+            if (allTargets.all { it.exists() && it.length() > 0 }) {
+                logger.lifecycle("[$abi] all native binaries satisfied by committed prebuilts — skipping download")
+            } else {
+                for (url in urls) {
+                    try {
+                        val debFile = ensureDeb(url, cacheDir, abi)
+                        extractDebBinaries(debFile, suffixMatchers)
+                    } catch (e: Exception) {
+                        // Non-fatal: prebuilts (or another package) may already
+                        // cover the required set. The required-check below is the
+                        // real gate — only a genuinely-missing binary fails the build.
+                        logger.warn("[$abi] could not fetch/extract $url (${e.message}); " +
+                            "relying on prebuilts / other packages")
                     }
                 }
-                extractDebBinaries(debFile, suffixMatchers)
             }
 
             // Only aapt2 / java / libjli.so are strictly required. The other JDK
@@ -129,6 +154,90 @@ abstract class PrepareNativeBinariesTask : DefaultTask() {
             if (optionalExtracted.isNotEmpty()) {
                 logger.lifecycle("[$abi] tools: $optionalExtracted")
             }
+        }
+    }
+
+    /**
+     * Copies committed prebuilt `lib*.so` for [abi] into [abiDir], skipping any
+     * that are already present and non-empty. Prebuilts live under
+     * `<rootProject>/prebuilts/native-jniLibs/<abi>/` (wired by the convention
+     * plugin); each file's parent-directory name identifies its ABI.
+     */
+    private fun seedFromPrebuilts(abi: String, abiDir: File) {
+        val files = prebuiltFiles.files
+        if (files.isEmpty()) return
+        var copied = 0
+        for (f in files) {
+            if (!f.isFile || f.parentFile?.name != abi) continue
+            val dest = File(abiDir, f.name)
+            if (!dest.exists() || dest.length() == 0L) {
+                f.copyTo(dest, overwrite = true)
+                copied++
+            }
+        }
+        if (copied > 0) logger.lifecycle("[$abi] seeded $copied prebuilt binary(ies) from repo")
+    }
+
+    /**
+     * Returns the cached .deb for [url], downloading it if absent. If the pinned
+     * URL fails (Termux's pool keeps only the latest patch and drops older files,
+     * so a version-pinned URL 404s after a bump), self-heals by resolving the
+     * current .deb for the same package + architecture from the pool listing.
+     */
+    private fun ensureDeb(url: String, cacheDir: File, abi: String): File {
+        val debFile = debCacheFile(url, cacheDir)
+        if (debFile.exists() && debFile.length() >= 1000) return debFile
+        debFile.parentFile.mkdirs()
+        try {
+            logger.lifecycle("[$abi] Downloading $url")
+            download(url, debFile)
+            return debFile
+        } catch (e: Exception) {
+            logger.lifecycle("[$abi] pinned URL failed (${e.message}); resolving current version from the Termux pool…")
+            val alt = resolveLatestUrl(url) ?: throw e
+            if (alt == url) throw e
+            val altFile = debCacheFile(alt, cacheDir)
+            if (altFile.exists() && altFile.length() >= 1000) return altFile
+            altFile.parentFile.mkdirs()
+            logger.lifecycle("[$abi] resolved current package -> $alt")
+            download(alt, altFile)
+            return altFile
+        }
+    }
+
+    private fun debCacheFile(url: String, cacheDir: File): File {
+        val fileName = url.substringAfterLast('/')
+            .substringBefore('?')
+            .substringBeforeLast(".deb") + ".deb"
+        return File(cacheDir, fileName)
+    }
+
+    private fun download(url: String, dest: File) {
+        URI(url).toURL().openStream().use { input ->
+            FileOutputStream(dest).use { output -> input.copyTo(output) }
+        }
+    }
+
+    /**
+     * Given a (possibly stale) Termux .deb URL, lists its pool directory and
+     * returns the URL of the current .deb for the same package + architecture.
+     * This makes the download path resilient to Termux's version rotation —
+     * the build no longer breaks when openjdk-17 / aapt2 bump a patch version.
+     * Returns null if the listing can't be fetched or parsed.
+     */
+    private fun resolveLatestUrl(originalUrl: String): String? {
+        return try {
+            val poolDir = originalUrl.substringBeforeLast('/')          // …/pool/main/o/openjdk-17
+            val fileName = originalUrl.substringAfterLast('/')          // openjdk-17_17.0.18_aarch64.deb
+            val pkg = fileName.substringBefore('_')                     // openjdk-17
+            val arch = fileName.substringBeforeLast(".deb").substringAfterLast('_')  // aarch64
+            val listing = URI("$poolDir/").toURL().readText()
+            val rx = Regex(Regex.escape(pkg) + "_[^\"<>]*_" + Regex.escape(arch) + "\\.deb")
+            rx.findAll(listing).map { it.value }.distinct().sortedDescending()
+                .firstOrNull()?.let { "$poolDir/$it" }
+        } catch (e: Exception) {
+            logger.warn("Could not resolve current package URL from pool for $originalUrl: ${e.message}")
+            null
         }
     }
 
