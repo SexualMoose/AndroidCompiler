@@ -50,9 +50,25 @@ class ProjectExtractor @Inject constructor() {
         // Unwrap single root directory if present
         val children = projectDir.listFiles() ?: return projectDir
         if (children.size == 1 && children[0].isDirectory) {
-            return children[0]
+            return sanitizeRootDirName(children[0])
         }
         return projectDir
+    }
+
+    /**
+     * The unwrapped root directory's name comes straight from the (untrusted)
+     * uploaded ZIP and later flows — single-quoted — into the shell command
+     * GradleCompiler builds (as the build working directory and in local.properties).
+     * A name containing a single quote or other shell metacharacters could break
+     * out of that quoting. Neutralize the only attacker-controlled component by
+     * renaming the dir to a fixed safe name whenever it isn't already in the
+     * safe character set [A-Za-z0-9._-].
+     */
+    private fun sanitizeRootDirName(rootDir: File): File {
+        if (rootDir.name.matches(Regex("[A-Za-z0-9._-]+"))) return rootDir
+        val safe = File(rootDir.parentFile, "project_root")
+        if (safe.exists()) safe.deleteRecursively()
+        return if (rootDir.renameTo(safe)) safe else rootDir
     }
 }
 
