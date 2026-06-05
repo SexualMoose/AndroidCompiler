@@ -1,7 +1,10 @@
 package com.androidcompiler.toolchain.jdk
 
 import android.content.Context
+import android.util.Log
 import com.androidcompiler.network.ChunkedDownloader
+import com.androidcompiler.toolchain.BuildConfig
+import com.androidcompiler.toolchain.pipeline.BuildDiagnostics
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -38,8 +41,18 @@ class TermuxJdkInstaller @Inject constructor(
     private val registry: ToolchainRegistry
 ) {
     companion object {
+        private const val TAG = "ACBuild"
         private const val TERMUX_REPO = "https://packages.termux.dev/apt/termux-main"
         private const val TERMUX_PREFIX = "data/data/com.termux/files/usr"
+
+        /**
+         * The OpenJDK 17 patch version baked into the APK's launcher binaries.
+         * The runtime JDK download is PINNED to this exact version so the
+         * launcher and libjvm.so always agree (a patch mismatch aborts JVM init).
+         * Single source of truth: app/build.gradle.kts `bundledJdkVersion`,
+         * mirrored into this module's BuildConfig (see toolchain/build.gradle.kts).
+         */
+        val BUNDLED_JDK_VERSION: String = BuildConfig.BUNDLED_JDK_VERSION
 
         /**
          * Primary ABI of this device as reported by Android.
@@ -76,8 +89,54 @@ class TermuxJdkInstaller @Inject constructor(
         // reinstall (new install hash). The JDK is still usable — GradleCompiler
         // re-creates the symlink on each compile.
         val javaHome = getJavaHome() ?: return false
-        return File(javaHome, "lib/modules").exists() ||
+        val contentPresent = File(javaHome, "lib/modules").exists() ||
                 File(javaHome, "lib/server/libjvm.so").exists()
+        if (!contentPresent) return false
+        // A stale JDK left over from a previous app version (different patch than
+        // the bundled launcher) is NOT usable — its libjvm.so won't match the
+        // launcher and JVM init aborts. Treat a version-mismatched JDK as "not
+        // installed" so the readiness gate forces a fresh, matched download.
+        if (!isVersionMatched()) {
+            Log.w(TAG, "JDK present but version mismatched " +
+                "(installed=${registry.getInstalledVersion("jdk")}, " +
+                "expected=$BUNDLED_JDK_VERSION) → reporting NOT installed")
+            return false
+        }
+        return true
+    }
+
+    /**
+     * True when the recorded installed JDK version equals the bundled launcher's
+     * version (BUNDLED_JDK_VERSION). A JDK installed by an older app build saved
+     * either the legacy "17" marker or an older patch like "17.0.18"; either way
+     * its libjvm.so won't match the current launcher, so this returns false and
+     * the JDK gets re-downloaded.
+     */
+    fun isVersionMatched(): Boolean {
+        val installed = registry.getInstalledVersion("jdk") ?: return false
+        return installed == BUNDLED_JDK_VERSION
+    }
+
+    /**
+     * Self-recovery: if a JDK is physically present but its recorded version
+     * doesn't match the bundled launcher, delete jdkDir so the next readiness
+     * check triggers a fresh, version-matched download. No user action required.
+     * Safe to call before any compile/readiness probe. Returns true if it wiped.
+     */
+    fun invalidateIfMismatched(): Boolean {
+        val javaHome = getJavaHome() ?: return false
+        val contentPresent = File(javaHome, "lib/modules").exists() ||
+                File(javaHome, "lib/server/libjvm.so").exists()
+        if (!contentPresent) return false
+        if (isVersionMatched()) return false
+        Log.w(TAG, "Invalidating stale JDK at ${jdkDir.absolutePath} " +
+            "(installed=${registry.getInstalledVersion("jdk")}, expected=$BUNDLED_JDK_VERSION)")
+        return try {
+            jdkDir.deleteRecursively()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to delete stale jdkDir: ${e.message}", e)
+            false
+        }
     }
 
     fun getJavaHome(): File? {
@@ -111,21 +170,30 @@ class TermuxJdkInstaller @Inject constructor(
         onProgress: (Float) -> Unit,
         onLog: (String) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
+        // Wrap onLog so every JDK-install line also lands in logcat and the
+        // persistent compile log — previously this path produced ZERO logcat.
+        val log: (String) -> Unit = { msg ->
+            Log.i(TAG, "[jdk-install] $msg")
+            persist("[jdk-install] $msg")
+            onLog(msg)
+        }
         try {
-            onLog("Fetching Termux package index...")
-            val packages = findPackages(onLog)
+            log("Installing OpenJDK pinned to $BUNDLED_JDK_VERSION (arch=${termuxArch()})")
+            log("Fetching Termux package index...")
+            val packages = findPackages(log)
             if (packages.isEmpty()) {
+                Log.e(TAG, "[jdk-install] no packages resolved for openjdk-17")
                 return@withContext Result.failure(Exception("Could not find openjdk-17 in Termux repo"))
             }
 
-            onLog("Found ${packages.size} package(s) to download")
+            log("Found ${packages.size} package(s) to download")
 
             jdkDir.mkdirs()
             val totalPackages = packages.size
             var completed = 0
 
             for (pkg in packages) {
-                onLog("Downloading: ${pkg.name} (${pkg.sizeBytes / 1024} KB)")
+                log("Downloading: ${pkg.name} (${pkg.sizeBytes / 1024} KB) <- ${pkg.url}")
                 val debFile = File(context.cacheDir, "${pkg.name}.deb")
 
                 val dlResult = chunkedDownloader.download(
@@ -140,12 +208,13 @@ class TermuxJdkInstaller @Inject constructor(
 
                 if (dlResult.isFailure) {
                     debFile.delete()
-                    return@withContext Result.failure(
-                        Exception("Failed to download ${pkg.name}: ${dlResult.exceptionOrNull()?.message}")
-                    )
+                    val err = "Failed to download ${pkg.name}: ${dlResult.exceptionOrNull()?.message}"
+                    Log.e(TAG, "[jdk-install] $err")
+                    persist("[jdk-install] $err")
+                    return@withContext Result.failure(Exception(err))
                 }
 
-                onLog("Extracting: ${pkg.name}")
+                log("Extracting: ${pkg.name}")
                 extractDeb(debFile, jdkDir)
                 debFile.delete()
                 completed++
@@ -153,30 +222,47 @@ class TermuxJdkInstaller @Inject constructor(
             }
 
             // Set permissions
-            onLog("Setting permissions...")
+            log("Setting permissions...")
             setExecutePermissions(jdkDir)
 
             // Verify — find java binary in the extracted tree
             val javaHome = getJavaHome()
             val javaBin = javaHome?.let { File(it, "bin/java") }
             if (javaBin == null || !javaBin.exists()) {
-                return@withContext Result.failure(
-                    Exception("Installation completed but java binary not found. " +
-                        "Searched in: ${jdkDir.absolutePath}")
-                )
+                val err = "Installation completed but java binary not found. " +
+                    "Searched in: ${jdkDir.absolutePath}"
+                Log.e(TAG, "[jdk-install] $err")
+                persist("[jdk-install] $err")
+                return@withContext Result.failure(Exception(err))
             }
             javaBin.setExecutable(true, false)
 
-            onLog("JDK installed: ${javaHome.absolutePath}")
-            registry.saveInstalledVersion("jdk", "17")
+            log("JDK installed: ${javaHome.absolutePath}")
+            // Save the FULL pinned version (not the legacy "17" marker) so the
+            // version-match self-recovery can detect a future launcher bump and
+            // re-download the matching JDK.
+            registry.saveInstalledVersion("jdk", BUNDLED_JDK_VERSION)
             Result.success(jdkDir)
         } catch (e: Exception) {
+            Log.e(TAG, "[jdk-install] JDK installation failed: ${e.message}", e)
+            persist("[jdk-install] FAILED: ${e.message}")
             Result.failure(Exception("JDK installation failed: ${e.message}", e))
         }
     }
 
+    /** The PINNED openjdk-17 .deb URL — must match the bundled launcher's patch
+     *  version. We never trust the live index for THIS file because the index
+     *  serves a moving target; a launcher↔libjvm.so mismatch aborts JVM init. */
+    private fun pinnedJdkUrl(): String =
+        "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_${BUNDLED_JDK_VERSION}_${termuxArch()}.deb"
+
     /**
      * Find the openjdk-17 package URL from Termux's Packages index.
+     *
+     * The openjdk-17 package itself is PINNED to [pinnedJdkUrl] (the exact patch
+     * version the bundled launcher was built against). The live index is used
+     * only to resolve the small dependency packages (libc++/libiconv/etc.), whose
+     * versions don't affect JVM init.
      */
     private fun findPackages(onLog: (String) -> Unit): List<PackageInfo> {
         val packages = mutableListOf<PackageInfo>()
@@ -194,8 +280,11 @@ class TermuxJdkInstaller @Inject constructor(
             // Find openjdk-17 (the meta-package that pulls in the JDK)
             val jdkPkg = entries["openjdk-17"] ?: entries["openjdk-17-jdk"]
             if (jdkPkg != null) {
-                packages.add(jdkPkg)
-                // Add direct dependencies
+                // Use the index entry ONLY for its dependency list + size, but
+                // OVERRIDE the download URL with the pinned version.
+                packages.add(jdkPkg.copy(url = pinnedJdkUrl()))
+                // Add direct dependencies (these stay on the live index — only
+                // the JDK's patch version is version-critical for the launcher).
                 jdkPkg.depends.forEach { dep ->
                     val depPkg = entries[dep]
                     if (depPkg != null) {
@@ -213,8 +302,13 @@ class TermuxJdkInstaller @Inject constructor(
 
         // If index parsing failed, try known direct URLs
         if (packages.isEmpty()) {
-            onLog("Using fallback package URLs")
+            onLog("Using fallback package URLs (pinned openjdk-17 $BUNDLED_JDK_VERSION)")
             packages.addAll(getFallbackPackages())
+        } else if (packages.none { it.name == "openjdk-17" }) {
+            // Index resolved deps but not the JDK meta-package itself — add the
+            // pinned JDK explicitly so we never silently skip it.
+            onLog("Index missing openjdk-17 entry; adding pinned $BUNDLED_JDK_VERSION")
+            packages.add(0, PackageInfo("openjdk-17", pinnedJdkUrl(), 95_507_372, emptyList()))
         }
 
         // Ensure critical packages are always present (libc++ is needed by
@@ -286,7 +380,8 @@ class TermuxJdkInstaller @Inject constructor(
     private fun getFallbackPackages(): List<PackageInfo> {
         val arch = termuxArch()
         return listOf(
-            PackageInfo("openjdk-17", "$TERMUX_REPO/pool/main/o/openjdk-17/openjdk-17_17.0.18_$arch.deb", 95_507_372, emptyList()),
+            // openjdk-17 PINNED to the bundled launcher's patch version.
+            PackageInfo("openjdk-17", pinnedJdkUrl(), 95_507_372, emptyList()),
             PackageInfo("libandroid-shmem", "$TERMUX_REPO/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_$arch.deb", 7_216, emptyList()),
             PackageInfo("libandroid-spawn", "$TERMUX_REPO/pool/main/liba/libandroid-spawn/libandroid-spawn_0.3_$arch.deb", 15_216, emptyList()),
             PackageInfo("libiconv", "$TERMUX_REPO/pool/main/libi/libiconv/libiconv_1.18-1_$arch.deb", 561_152, emptyList()),
@@ -559,6 +654,9 @@ class TermuxJdkInstaller @Inject constructor(
         val rem = size % 512
         return if (rem == 0L) size else size + (512 - rem)
     }
+
+    /** Mirror an install line into the persistent on-device compile log. */
+    private fun persist(line: String) = BuildDiagnostics.append(context, line)
 
     data class PackageInfo(
         val name: String,

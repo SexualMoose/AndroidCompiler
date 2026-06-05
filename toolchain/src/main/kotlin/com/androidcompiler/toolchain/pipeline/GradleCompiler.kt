@@ -1,6 +1,7 @@
 package com.androidcompiler.toolchain.pipeline
 
 import android.content.Context
+import android.util.Log
 import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.ErrorSeverity
 import com.androidcompiler.toolchain.jdk.TermuxJdkInstaller
@@ -35,11 +36,45 @@ class GradleCompiler @Inject constructor(
     private val jdkInstaller: TermuxJdkInstaller
 ) {
     companion object {
+        private const val TAG = BuildDiagnostics.TAG
         private const val GRADLE_WRAPPER_VERSION = "8.11.1"
         private val TERMUX_JDK_PATHS = listOf(
             "/data/data/com.termux/files/usr",
             "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
         )
+
+        /**
+         * Substrings in Gradle's output that indicate the forked build JVM could
+         * not start — almost always a launcher↔libjvm.so patch mismatch or a
+         * corrupt/partial JDK. Used to trigger the one-shot JDK-repair retry.
+         */
+        private val JVM_INIT_FAILURE_MARKERS = listOf(
+            "Could not create the Java Virtual Machine",
+            "Error occurred during initialization of VM",
+            "libjvm",
+            "Failed to load libjli",
+            "JNI_CreateJavaVM",
+            "error while loading shared libraries",
+            "cannot execute binary file"
+        )
+    }
+
+    /** Tee a line to both the in-app log UI and logcat/persistent file. */
+    private fun logBoth(onLog: LogCallback, message: String, severity: ErrorSeverity) {
+        when (severity) {
+            ErrorSeverity.ERROR -> Log.e(TAG, message)
+            ErrorSeverity.WARNING -> Log.w(TAG, message)
+            else -> Log.i(TAG, message)
+        }
+        BuildDiagnostics.append(context, "[$severity] $message")
+        onLog(message, severity)
+    }
+
+    /** True when [result]'s output looks like a JVM that failed to initialize. */
+    private fun isJvmInitFailure(result: ProcessResult): Boolean {
+        if (result.exitCode == 0) return false
+        val output = result.stdout + "\n" + result.stderr
+        return JVM_INIT_FAILURE_MARKERS.any { output.contains(it, ignoreCase = true) }
     }
 
     /** Overrides for the per-compile version selection. Null fields fall back to
@@ -57,7 +92,25 @@ class GradleCompiler @Inject constructor(
         overrides: VersionOverrides = VersionOverrides()
     ): StepResult = withContext(Dispatchers.IO) {
 
-        onLog("Detected Gradle project: ${projectInfo.packageName ?: projectDir.name}", ErrorSeverity.INFO)
+        // Persistent diagnostics: open a fresh section in last_compile.log and
+        // tee key milestones to logcat (tag ACBuild). Previously this path had
+        // ZERO logcat, so on-device build failures were undebuggable.
+        BuildDiagnostics.beginSession(
+            context,
+            "Gradle compile: ${projectInfo.packageName ?: projectDir.name}"
+        )
+
+        // Self-recovery (step 3): if a JDK from a previous app version is left in
+        // filesDir whose patch version no longer matches the bundled launcher,
+        // wipe it now so the readiness check below forces a fresh, matched
+        // download. Silent, no user action.
+        if (jdkInstaller.invalidateIfMismatched()) {
+            logBoth(onLog, "Removed a stale/mismatched JDK; a matched one will be re-downloaded.",
+                ErrorSeverity.WARNING)
+        }
+
+        logBoth(onLog, "Detected Gradle project: ${projectInfo.packageName ?: projectDir.name}",
+            ErrorSeverity.INFO)
 
         // Resolve the effective versions for this compile
         val effectiveGradleVersion = overrides.gradleVersion
@@ -66,12 +119,12 @@ class GradleCompiler @Inject constructor(
         val effectiveApiLevel = overrides.compileSdk
             ?: projectInfo.requiredCompileSdk
             ?: registry.defaultApiLevel
-        onLog("Using Gradle $effectiveGradleVersion, compileSdk $effectiveApiLevel", ErrorSeverity.INFO)
+        logBoth(onLog, "Using Gradle $effectiveGradleVersion, compileSdk $effectiveApiLevel", ErrorSeverity.INFO)
 
         // Find a working JDK (Termux)
         val javaHome = findJavaHome()
         if (javaHome == null) {
-            onLog("No compatible JDK found on device", ErrorSeverity.ERROR)
+            logBoth(onLog, "No compatible JDK found on device", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR, buildString {
                     appendLine("Gradle projects require a JDK (OpenJDK 17).")
@@ -87,8 +140,10 @@ class GradleCompiler @Inject constructor(
 
         val javaBin = pickJavaBinary(javaHome)
         val bundledJava = registry.getBundledJavaLauncher() != null && javaBin == registry.getBundledJavaLauncher()
-        onLog("JDK: ${javaHome.absolutePath}", ErrorSeverity.INFO)
-        onLog("java: ${javaBin.absolutePath} ${if (bundledJava) "(bundled APK)" else "(downloaded)"}", ErrorSeverity.INFO)
+        logBoth(onLog, "JDK: ${javaHome.absolutePath}", ErrorSeverity.INFO)
+        logBoth(onLog, "java: ${javaBin.absolutePath} ${if (bundledJava) "(bundled APK)" else "(downloaded)"} " +
+            "[pinned=${TermuxJdkInstaller.BUNDLED_JDK_VERSION}, installed=${registry.getInstalledVersion("jdk")}]",
+            ErrorSeverity.INFO)
 
         // When using the bundled launcher, Gradle will still internally try to
         // spawn `$JAVA_HOME/bin/java` (JVM probing), `$JAVA_HOME/bin/jlink`
@@ -112,6 +167,7 @@ class GradleCompiler @Inject constructor(
         // Ensure wrapper JAR (version-specific if available, fallback to bundled)
         val wrapperJar = ensureGradleWrapperJar(projectDir, effectiveGradleVersion, onLog)
         if (wrapperJar == null) {
+            logBoth(onLog, "gradle-wrapper.jar not found", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
                     "gradle-wrapper.jar not found. Download it from the Components tab.")
@@ -249,17 +305,54 @@ exec '${realBin.absolutePath}' "${'$'}@"
         // which allows executing binaries from the app's data directory.
         val command = listOf("/system/bin/sh", "-c", shellCmd)
 
-        onLog("Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
-        onLog("LD_LIBRARY_PATH: $ldPath", ErrorSeverity.INFO)
+        // Persist the EXACT command + key env BEFORE exec. A JVM-init crash can
+        // kill the forked process before any output is captured; writing this
+        // first guarantees the diagnostics file always shows what we tried to run.
+        val buildOutputFile = File(context.filesDir, "gradle_build_output.txt")
+        try {
+            buildOutputFile.writeText(buildString {
+                appendLine("=== COMMAND (written pre-exec) ===")
+                appendLine("/system/bin/sh -c <<")
+                appendLine(shellCmd)
+                appendLine(">>")
+                appendLine("JAVA_HOME=${javaHome.absolutePath}")
+                appendLine("java binary=${javaBin.absolutePath} (bundled=$bundledJava)")
+                appendLine("LD_LIBRARY_PATH=$ldPath")
+                appendLine("BUNDLED_JDK_VERSION=${TermuxJdkInstaller.BUNDLED_JDK_VERSION}")
+                appendLine("installed jdk version=${registry.getInstalledVersion("jdk")}")
+                appendLine("=== (stdout/stderr appended after exec) ===")
+            })
+        } catch (_: Exception) { }
+
+        logBoth(onLog, "Running: gradlew assembleDebug --no-daemon", ErrorSeverity.INFO)
+        logBoth(onLog, "LD_LIBRARY_PATH: $ldPath", ErrorSeverity.INFO)
 
         var result = executeGradleBuild(command, projectDir, onLog)
 
-        // If Gradle failed resolving its own classpath (typically kspClasspath after
-        // a wiped cache from pm clear), nuke the modules cache and retry once.
-        // The cache sits at gradle_home/caches/modules-2 and can be left in a
-        // partially-populated state if a download was interrupted.
-        if (result.exitCode != 0 && shouldRetryWithCacheReset(result)) {
-            onLog(
+        // ─── Single one-shot repair + retry ──────────────────────────────────
+        // At most ONE retry, to avoid loops. The repair performed depends on how
+        // the first attempt failed:
+        //   (a) JVM-init failure (launcher↔libjvm.so mismatch / corrupt JDK):
+        //       wipe jdk17, re-download the PINNED JDK, re-link the launchers,
+        //       then retry. This is the self-recovery the user asked for — it
+        //       runs inside this coroutine and never aborts the task.
+        //   (b) Dependency-cache corruption (e.g. interrupted download after a
+        //       pm clear): wipe caches/modules-2 and retry.
+        if (result.exitCode != 0 && isJvmInitFailure(result)) {
+            logBoth(onLog,
+                "JVM failed to initialize — likely a stale/corrupt JDK. Re-downloading the " +
+                "pinned OpenJDK ${TermuxJdkInstaller.BUNDLED_JDK_VERSION} and retrying once...",
+                ErrorSeverity.WARNING)
+            val repaired = repairJdkAndRelink(javaHome, bundledJava, onLog)
+            if (repaired) {
+                result = executeGradleBuild(command, projectDir, onLog)
+            }
+        } else if (result.exitCode != 0 && shouldRetryWithCacheReset(result)) {
+            // If Gradle failed resolving its own classpath (typically kspClasspath after
+            // a wiped cache from pm clear), nuke the modules cache and retry once.
+            // The cache sits at gradle_home/caches/modules-2 and can be left in a
+            // partially-populated state if a download was interrupted.
+            logBoth(onLog,
                 "Gradle dependency cache appears corrupted (${detectResolutionFailure(result)}). " +
                 "Clearing caches/modules-2 and retrying once...",
                 ErrorSeverity.WARNING
@@ -269,20 +362,24 @@ exec '${realBin.absolutePath}' "${'$'}@"
                 File(gradleHome, "caches/transforms-4").deleteRecursively()
                 File(gradleHome, "caches/jars-9").deleteRecursively()
             } catch (e: Exception) {
-                onLog("Cache cleanup failed: ${e.message}", ErrorSeverity.WARNING)
+                logBoth(onLog, "Cache cleanup failed: ${e.message}", ErrorSeverity.WARNING)
             }
             result = executeGradleBuild(command, projectDir, onLog)
         }
 
-        // Write full build output to persistent location for debugging
+        // Append full build output to the persistent diagnostics file (the
+        // command + env were already written pre-exec above).
         try {
-            File(context.filesDir, "gradle_build_output.txt").writeText(
-                "=== STDOUT ===\n${result.stdout}\n=== STDERR ===\n${result.stderr}\n=== EXIT: ${result.exitCode} ===\n"
+            buildOutputFile.appendText(
+                "\n=== STDOUT ===\n${result.stdout}\n=== STDERR ===\n${result.stderr}\n=== EXIT: ${result.exitCode} ===\n"
             )
         } catch (_: Exception) { }
 
         if (result.exitCode != 0) {
             val allOutput = result.stderr + "\n" + result.stdout
+            logBoth(onLog,
+                "Gradle build failed (exit ${result.exitCode}). Full output in last_compile.log / gradle_build_output.txt",
+                ErrorSeverity.ERROR)
             val errors = parseGradleErrors(allOutput)
             return@withContext StepResult.Failure(errors.ifEmpty {
                 listOf(CompilationError("Gradle", ErrorSeverity.ERROR,
@@ -292,6 +389,7 @@ exec '${realBin.absolutePath}' "${'$'}@"
 
         val apk = findProducedApk(projectDir)
         if (apk == null) {
+            logBoth(onLog, "Build completed but no APK found", ErrorSeverity.ERROR)
             return@withContext StepResult.Failure(listOf(
                 CompilationError("Gradle", ErrorSeverity.ERROR,
                     "Build completed but no APK found.\n${result.stdout.takeLast(500)}")
@@ -300,9 +398,58 @@ exec '${realBin.absolutePath}' "${'$'}@"
 
         val outputApk = File(outputDir, apk.name)
         apk.copyTo(outputApk, overwrite = true)
-        onLog("APK: ${outputApk.name} (${outputApk.length() / 1024} KB)", ErrorSeverity.INFO)
+        logBoth(onLog, "APK: ${outputApk.name} (${outputApk.length() / 1024} KB)", ErrorSeverity.INFO)
 
         StepResult.Success(listOf(outputApk))
+    }
+
+    /**
+     * Self-recovery for a JVM-init failure: wipe the downloaded JDK, re-download
+     * the PINNED OpenJDK (so the launcher and libjvm.so agree), and re-create the
+     * symlinks from `$JAVA_HOME/bin/<tool>` to the APK-bundled launchers (the
+     * wipe deleted them). Runs inside the existing compile coroutine and surfaces
+     * a single WARNING; it never throws. Returns true if the JDK is usable again.
+     *
+     * The downloaded JDK always extracts to the same path (filesDir/toolchain/jdk17),
+     * so [javaHome] and the LD_LIBRARY_PATH derived from it remain valid after the
+     * reinstall — the caller can re-run the identical build command.
+     */
+    private suspend fun repairJdkAndRelink(
+        javaHome: File,
+        bundledJava: Boolean,
+        onLog: LogCallback
+    ): Boolean {
+        return try {
+            logBoth(onLog, "Self-recovery: wiping ${jdkInstaller.jdkDir.absolutePath}", ErrorSeverity.WARNING)
+            jdkInstaller.jdkDir.deleteRecursively()
+            // Clear the recorded version so a partial/failed reinstall can't be
+            // mistaken for a matched JDK on the next readiness check.
+            registry.saveInstalledVersion("jdk", "")
+
+            val installResult = jdkInstaller.install(
+                onProgress = { },
+                onLog = { msg -> BuildDiagnostics.append(context, "[jdk-repair] $msg") }
+            )
+            if (installResult.isFailure) {
+                logBoth(onLog,
+                    "Self-recovery FAILED: could not re-download JDK: ${installResult.exceptionOrNull()?.message}",
+                    ErrorSeverity.ERROR)
+                return false
+            }
+
+            // Re-resolve JAVA_HOME (same path) and re-link the bundled launchers.
+            val freshJavaHome = findJavaHome() ?: javaHome
+            if (bundledJava) {
+                linkJdkToolsToBundled(freshJavaHome, onLog)
+            }
+            logBoth(onLog,
+                "Self-recovery OK: re-installed pinned OpenJDK ${TermuxJdkInstaller.BUNDLED_JDK_VERSION}; retrying build.",
+                ErrorSeverity.INFO)
+            true
+        } catch (e: Exception) {
+            logBoth(onLog, "Self-recovery threw: ${e.message}", ErrorSeverity.ERROR)
+            false
+        }
     }
 
     /**

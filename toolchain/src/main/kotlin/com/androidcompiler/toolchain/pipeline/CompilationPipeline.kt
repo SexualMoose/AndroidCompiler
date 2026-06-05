@@ -1,10 +1,13 @@
 package com.androidcompiler.toolchain.pipeline
 
+import android.content.Context
+import android.util.Log
 import com.androidcompiler.core.common.model.CompilationError
 import com.androidcompiler.core.common.model.CompilationStep
 import com.androidcompiler.core.common.model.ErrorSeverity
 import com.androidcompiler.toolchain.compute.PerformanceHintHelper
 import com.androidcompiler.toolchain.registry.ToolchainRegistry
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -30,6 +33,7 @@ typealias LogCallback = (message: String, severity: ErrorSeverity) -> Unit
 
 @Singleton
 class CompilationPipeline @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val projectExtractor: ProjectExtractor,
     private val projectAnalyzer: ProjectAnalyzer,
     private val gradleCompiler: GradleCompiler,
@@ -52,6 +56,20 @@ class CompilationPipeline @Inject constructor(
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult = withContext(Dispatchers.Default) {
+        // Tee every pipeline log line to logcat (tag ACBuild) + the persistent
+        // last_compile.log, then forward to the in-app UI callback. This is the
+        // single place the whole compile is captured for on-device debugging.
+        BuildDiagnostics.beginSession(context, "Compile pipeline: ${File(zipPath).name}")
+        val onLog: LogCallback = { message, severity ->
+            when (severity) {
+                ErrorSeverity.ERROR -> Log.e(BuildDiagnostics.TAG, message)
+                ErrorSeverity.WARNING -> Log.w(BuildDiagnostics.TAG, message)
+                else -> Log.i(BuildDiagnostics.TAG, message)
+            }
+            BuildDiagnostics.append(context, "[$severity] $message")
+            onLog(message, severity)
+        }
+
         val toolchainDir = registry.toolchainDir
         val buildDir = File(outputDir, "build").apply {
             if (exists()) deleteRecursively()
@@ -69,6 +87,7 @@ class CompilationPipeline @Inject constructor(
         val projectDir = try {
             projectExtractor.extract(zipPath, buildDir)
         } catch (e: Exception) {
+            onLog("Failed to extract ZIP: ${e.message}", ErrorSeverity.ERROR)
             return@withContext CompilationResult.Failure(
                 listOf(CompilationError("Extract", ErrorSeverity.ERROR, "Failed to extract ZIP: ${e.message}")),
                 CompilationStep.EXTRACTING
@@ -91,6 +110,7 @@ class CompilationPipeline @Inject constructor(
             }
             ProjectAnalyzer.ProjectType.SIMPLE_PROJECT -> {
                 if (!registry.isAllInstalled()) {
+                    onLog("Toolchain components not fully installed", ErrorSeverity.ERROR)
                     return@withContext CompilationResult.Failure(
                         listOf(CompilationError("Setup", ErrorSeverity.ERROR,
                             "Toolchain components not fully installed. Go to Components tab to download.")),
@@ -102,6 +122,7 @@ class CompilationPipeline @Inject constructor(
                     incrementalFileNames, onProgress, onLog)
             }
             ProjectAnalyzer.ProjectType.UNKNOWN -> {
+                onLog("Could not determine project structure", ErrorSeverity.ERROR)
                 return@withContext CompilationResult.Failure(
                     listOf(CompilationError("Analyze", ErrorSeverity.ERROR,
                         "Could not determine project structure. Expected AndroidManifest.xml and source files, " +

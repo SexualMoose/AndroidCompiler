@@ -5,6 +5,7 @@ import com.androidcompiler.core.common.model.ComponentStatus
 import com.androidcompiler.core.common.model.ComponentType
 import com.androidcompiler.core.common.model.DownloadSource
 import com.androidcompiler.core.common.model.ToolchainComponent
+import com.androidcompiler.toolchain.BuildConfig
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
 import javax.inject.Inject
@@ -152,7 +153,11 @@ class ToolchainRegistry @Inject constructor(
 
     fun getComponentStatus(component: ToolchainComponent): ComponentStatus {
         if (component.type == ComponentType.JDK_ARCHIVE) {
-            return if (isJdkInstalled()) ComponentStatus.Installed
+            // Version-aware: a JDK whose recorded patch version doesn't match the
+            // bundled launcher (BUNDLED_JDK_VERSION) is unusable — its libjvm.so
+            // won't match the launcher and JVM init aborts. Report it NotInstalled
+            // so the readiness gate re-downloads a matched one (self-recovery).
+            return if (isJdkInstalled() && isJdkVersionMatched()) ComponentStatus.Installed
                    else ComponentStatus.NotInstalled
         }
         val file = getComponentFile(component)
@@ -208,6 +213,19 @@ class ToolchainRegistry @Inject constructor(
     }
 
     fun isJdkInstalled(): Boolean = getJavaHome() != null
+
+    /**
+     * True when the recorded installed JDK version equals the bundled launcher's
+     * patch version (BuildConfig.BUNDLED_JDK_VERSION). A JDK left over from an
+     * older app build saved either the legacy "17" marker or an older patch like
+     * "17.0.18"; either is unusable with the current launcher, so this returns
+     * false and the readiness gate forces a fresh, matched download.
+     *
+     * Kept in ToolchainRegistry (rather than delegating to TermuxJdkInstaller) to
+     * avoid a DI cycle — TermuxJdkInstaller already depends on this registry.
+     */
+    fun isJdkVersionMatched(): Boolean =
+        getInstalledVersion("jdk") == BuildConfig.BUNDLED_JDK_VERSION
 
     // --- Installed version tracking ---
     // Stores which version is actually installed (may differ from registry default after updates)

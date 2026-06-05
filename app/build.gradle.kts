@@ -11,6 +11,15 @@ plugins {
     id("androidcompiler.native.binaries")
 }
 
+// ── SINGLE SOURCE OF TRUTH for the bundled OpenJDK 17 patch version ──────────
+// The launcher binaries baked into the APK (libjava.so / libjli.so) come from
+// THIS exact openjdk-17 .deb. The runtime JDK download (TermuxJdkInstaller) MUST
+// resolve the identical patch version — a launcher↔libjvm.so patch mismatch
+// aborts JVM init and every Gradle compile fails. Both the bundled-binary URLs
+// below AND the runtime pin (toolchain BuildConfig.BUNDLED_JDK_VERSION) derive
+// from this one string, so bumping it here updates everything atomically.
+val bundledJdkVersion = "17.0.19"
+
 nativeBinaries {
     // Ship native binaries for both primary Android ABIs.
     // arm64-v8a covers every modern phone (S26 Ultra, etc.); x86_64 covers
@@ -22,14 +31,17 @@ nativeBinaries {
     // (1) seeding committed prebuilts from prebuilts/native-jniLibs/ first, and
     // (2) if a pinned URL fails, resolving the current .deb from the pool listing.
     // Bump these when convenient, but the build no longer breaks if they go stale.
+    // openjdk-17 URLs are built from `bundledJdkVersion` so the bundled launcher
+    // and the runtime-downloaded JDK never drift apart.
+    val pool = "https://packages.termux.dev/apt/termux-main/pool/main"
     packagesByAbi.set(mapOf(
         "arm64-v8a" to listOf(
-            "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
-            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.19_aarch64.deb"
+            "$pool/a/aapt2/aapt2_13.0.0.6-23_aarch64.deb",
+            "$pool/o/openjdk-17/openjdk-17_${bundledJdkVersion}_aarch64.deb"
         ),
         "x86_64" to listOf(
-            "https://packages.termux.dev/apt/termux-main/pool/main/a/aapt2/aapt2_13.0.0.6-23_x86_64.deb",
-            "https://packages.termux.dev/apt/termux-main/pool/main/o/openjdk-17/openjdk-17_17.0.19_x86_64.deb"
+            "$pool/a/aapt2/aapt2_13.0.0.6-23_x86_64.deb",
+            "$pool/o/openjdk-17/openjdk-17_${bundledJdkVersion}_x86_64.deb"
         )
     ))
 }
@@ -46,8 +58,15 @@ android {
         // bundled in the APK's native library dir, which is exec-allowed for
         // every targetSdk. See app/src/main/jniLibs/arm64-v8a/lib*.so.
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.1"
+        versionCode = 4
+        versionName = "1.1.2"
+
+        // Exposed to runtime so the in-app UI / diagnostics can show which JDK
+        // the APK's launcher was built against. The authoritative runtime pin
+        // for the JDK DOWNLOAD lives in the :toolchain module's BuildConfig
+        // (same literal), because TermuxJdkInstaller can't read the app's
+        // BuildConfig. Keep both in sync via `bundledJdkVersion` above.
+        buildConfigField("String", "BUNDLED_JDK_VERSION", "\"$bundledJdkVersion\"")
 
         // Ship both primary Android ABIs. arm64-v8a is the real-device target,
         // x86_64 lets Android Studio's stock emulator run the same APK.
@@ -82,14 +101,22 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {
         jniLibs {
-            // CRITICAL: Keep bundled binaries uncompressed so Android extracts them
-            // directly to nativeLibraryDir (which is exec-allowed). With the default
-            // compression, they'd get re-extracted to app_data_file at runtime and
-            // fail SELinux exec checks.
+            // CRITICAL — DO NOT flip this to false. useLegacyPackaging=true sets
+            // extractNativeLibs=true, so the installer EXTRACTS our bundled
+            // binaries (libjava.so, libjli.so, libaapt2.so) into the app's
+            // nativeLibraryDir at install time. nativeLibraryDir is the only
+            // exec-allowed location on targetSdk>=29, and exec'ing the launcher
+            // from there is exactly what makes on-device compilation work.
+            // (The libs ARE compressed inside the APK — that's fine; what matters
+            // is that they're extracted to the exec-allowed dir, not mmap'd
+            // uncompressed from the APK, which would NOT be exec-allowed.)
+            // Setting useLegacyPackaging=false (extractNativeLibs=false) would
+            // leave them only inside the APK → no exec path → every build fails.
             useLegacyPackaging = true
             // Don't let AGP strip these "libraries" — they're actually binaries
             // and their entry points aren't standard .so exports.
