@@ -148,10 +148,35 @@ class CompilationPipeline @Inject constructor(
         onProgress: ProgressCallback,
         onLog: LogCallback
     ): CompilationResult {
-        onProgress(CompilationStep.COMPILING_SOURCES, 0f)
+        onProgress(CompilationStep.GRADLE_BUILD, 0.02f)
         onLog("Starting Gradle build...", ErrorSeverity.INFO)
 
-        val result = gradleCompiler.compile(projectDir, outputDir, projectInfo, onLog, overrides)
+        // Drive the progress bar from Gradle's LIVE task output. gradleCompiler streams
+        // each "> Task :…" line (and Configure/Downloading) to onLog as the build runs,
+        // so we advance a MONOTONIC 0..0.97 estimate from the task count (asymptotic —
+        // Gradle never prints a task total up front) and snap to known milestones
+        // (resources → kotlin compile → java-res → dex → package → assemble), which also
+        // moves the step LABEL through the real phases. Previously this passed the raw
+        // onLog and a fixed 0f, so the bar sat EMPTY for the whole (minutes-long) build
+        // then jumped straight to full — exactly the "empty bar" the user saw.
+        var tasksSeen = 0
+        var lastP = 0.02f
+        var curStep = CompilationStep.GRADLE_BUILD
+        val progressOnLog: LogCallback = { message, severity ->
+            val t = message.trimStart()
+            if (t.startsWith("> Task")) tasksSeen++
+            val milestone = gradleMilestone(t)
+            if (milestone != null) curStep = milestone.first
+            val byCount = 0.05f + 0.85f * (tasksSeen.toFloat() / (tasksSeen + 14f))
+            val p = maxOf(lastP, milestone?.second ?: 0f, byCount).coerceAtMost(0.97f)
+            if (p > lastP || milestone != null) {
+                lastP = p
+                onProgress(curStep, p)
+            }
+            onLog(message, severity)
+        }
+
+        val result = gradleCompiler.compile(projectDir, outputDir, projectInfo, progressOnLog, overrides)
 
         return when (result) {
             is StepResult.Success -> {
@@ -165,6 +190,36 @@ class CompilationPipeline @Inject constructor(
                 CompilationResult.Failure(result.errors, CompilationStep.COMPILING_SOURCES)
             }
         }
+    }
+
+    /**
+     * Maps a Gradle "> Task :…" line (or "BUILD SUCCESSFUL") to a (step, fraction) so the
+     * progress bar + label track the real build phase. The compiler always runs
+     * assembleDebug, so only debug task names are matched. Returns null for lines that
+     * aren't progress milestones (the caller still advances the bar by task count).
+     */
+    private fun gradleMilestone(line: String): Pair<CompilationStep, Float>? = when {
+        line.contains("BUILD SUCCESSFUL") -> CompilationStep.SIGNING to 0.99f
+        line.startsWith("> Configure project") -> CompilationStep.GRADLE_BUILD to 0.05f
+        !line.startsWith("> Task") -> null
+        line.contains("assembleDebug") -> CompilationStep.SIGNING to 0.97f
+        line.contains("packageDebug") -> CompilationStep.PACKAGING to 0.90f
+        line.contains("DexBuilderDebug") || line.contains("dexBuilderDebug") ||
+            line.contains("mergeDexDebug") || line.contains("mergeProjectDexDebug") ||
+            line.contains("mergeExtDexDebug") -> CompilationStep.DEXING to 0.80f
+        line.contains("processDebugJavaRes") || line.contains("mergeDebugJavaResource") ->
+            CompilationStep.COMPILING_SOURCES to 0.68f
+        line.contains("compileDebugJavaWithJavac") -> CompilationStep.COMPILING_SOURCES to 0.60f
+        line.contains("compileDebugKotlin") || line.contains("kaptDebug") ||
+            line.contains("kspDebug") -> CompilationStep.COMPILING_SOURCES to 0.50f
+        line.contains("mergeDebugResources") || line.contains("processDebugResources") ->
+            CompilationStep.COMPILING_RESOURCES to 0.32f
+        line.contains("processDebugManifest") -> CompilationStep.COMPILING_RESOURCES to 0.28f
+        line.contains("generateDebugResources") || line.contains("mergeDebugAssets") ||
+            line.contains("mapDebugSourceSetPaths") -> CompilationStep.COMPILING_RESOURCES to 0.22f
+        line.contains("preBuild") || line.contains("preDebugBuild") ||
+            line.contains("generateDebugResValues") -> CompilationStep.GRADLE_BUILD to 0.10f
+        else -> null
     }
 
     private suspend fun compileSimple(
