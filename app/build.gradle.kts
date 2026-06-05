@@ -46,8 +46,8 @@ android {
         // bundled in the APK's native library dir, which is exec-allowed for
         // every targetSdk. See app/src/main/jniLibs/arm64-v8a/lib*.so.
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
 
         // Ship both primary Android ABIs. arm64-v8a is the real-device target,
         // x86_64 lets Android Studio's stock emulator run the same APK.

@@ -36,9 +36,6 @@ class GradleCompiler @Inject constructor(
 ) {
     companion object {
         private const val GRADLE_WRAPPER_VERSION = "8.11.1"
-        // Hard ceiling on accumulated build stdout/stderr kept in memory (10MB each).
-        // Beyond this we keep draining the pipe but stop buffering, to avoid OOM.
-        private const val MAX_BUILD_OUTPUT_CHARS = 10 * 1024 * 1024
         private val TERMUX_JDK_PATHS = listOf(
             "/data/data/com.termux/files/usr",
             "/data/data/com.termux/files/usr/lib/jvm/java-17-openjdk"
@@ -277,14 +274,10 @@ exec '${realBin.absolutePath}' "${'$'}@"
             result = executeGradleBuild(command, projectDir, onLog)
         }
 
-        // Write build output to persistent location for debugging. The in-memory
-        // builders are already capped, but bound each section again here so the
-        // on-disk debug file can't grow unbounded either.
+        // Write full build output to persistent location for debugging
         try {
             File(context.filesDir, "gradle_build_output.txt").writeText(
-                "=== STDOUT ===\n${result.stdout.takeLast(MAX_BUILD_OUTPUT_CHARS)}\n" +
-                "=== STDERR ===\n${result.stderr.takeLast(MAX_BUILD_OUTPUT_CHARS)}\n" +
-                "=== EXIT: ${result.exitCode} ===\n"
+                "=== STDOUT ===\n${result.stdout}\n=== STDERR ===\n${result.stderr}\n=== EXIT: ${result.exitCode} ===\n"
             )
         } catch (_: Exception) { }
 
@@ -771,25 +764,11 @@ zipStorePath=wrapper/dists
             val stdoutBuilder = StringBuilder()
             val stderrBuilder = StringBuilder()
 
-            // Cap accumulated output so a runaway build (e.g. an infinite
-            // download/retry loop or a misbehaving plugin) can't OOM the app.
-            // Once the cap is hit we keep reading the stream — so the child
-            // never blocks on a full pipe — but stop appending and flag that
-            // truncation happened.
-            var stdoutTruncated = false
-            var stderrTruncated = false
-
             val stdoutThread = Thread {
                 try {
                     BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
                         reader.lineSequence().forEach { line ->
-                            if (stdoutBuilder.length < MAX_BUILD_OUTPUT_CHARS) {
-                                stdoutBuilder.appendLine(line)
-                            } else if (!stdoutTruncated) {
-                                stdoutTruncated = true
-                                stdoutBuilder.appendLine(
-                                    "\n[output truncated at ${MAX_BUILD_OUTPUT_CHARS / (1024 * 1024)}MB — draining remainder]")
-                            }
+                            stdoutBuilder.appendLine(line)
                             when {
                                 line.startsWith("> Task") -> onLog(line, ErrorSeverity.INFO)
                                 line.contains("BUILD SUCCESSFUL") -> onLog(line, ErrorSeverity.INFO)
@@ -812,13 +791,7 @@ zipStorePath=wrapper/dists
                 try {
                     BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
                         reader.lineSequence().forEach { line ->
-                            if (stderrBuilder.length < MAX_BUILD_OUTPUT_CHARS) {
-                                stderrBuilder.appendLine(line)
-                            } else if (!stderrTruncated) {
-                                stderrTruncated = true
-                                stderrBuilder.appendLine(
-                                    "\n[output truncated at ${MAX_BUILD_OUTPUT_CHARS / (1024 * 1024)}MB — draining remainder]")
-                            }
+                            stderrBuilder.appendLine(line)
                             if (line.isNotBlank()) onLog("[stderr] $line", ErrorSeverity.WARNING)
                         }
                     }

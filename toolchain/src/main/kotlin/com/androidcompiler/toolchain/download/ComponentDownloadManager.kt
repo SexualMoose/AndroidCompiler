@@ -10,15 +10,11 @@ import com.androidcompiler.toolchain.registry.ToolchainRegistry
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
 import javax.inject.Inject
@@ -31,15 +27,6 @@ class ComponentDownloadManager @Inject constructor(
     private val registry: ToolchainRegistry,
     private val termuxJdkInstaller: TermuxJdkInstaller
 ) {
-    // OkHttp (TLS + timeouts) for fetching the Termux Packages index. Using this
-    // instead of raw java.net.URL().openStream() gives us connect/read timeouts
-    // and keeps index fetching on the same hardened client path as the JDK installer.
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .build()
-
     suspend fun downloadComponent(
         component: ToolchainComponent,
         onProgress: (Float) -> Unit
@@ -164,27 +151,17 @@ class ComponentDownloadManager @Inject constructor(
         targetFile.parentFile?.mkdirs()
 
         val total = packages.size
-        for ((index, pkg) in packages.withIndex()) {
+        for ((index, url) in packages.withIndex()) {
             val debFile = File(context.cacheDir, "aapt2_pkg_$index.deb")
             try {
                 val result = chunkedDownloader.download(
-                    url = pkg.url,
+                    url = url,
                     outputFile = debFile,
                     onProgress = { _, _ ->
                         onProgress((index.toFloat() + 0.5f) / total)
                     }
                 )
                 result.getOrThrow()
-                // Verify integrity against the index SHA256 when we have one
-                // (fallback URLs carry no checksum and stay best-effort).
-                val expected = pkg.sha256
-                if (expected != null) {
-                    val actual = sha256Of(debFile)
-                    if (!actual.equals(expected, ignoreCase = true)) {
-                        throw Exception(
-                            "Checksum mismatch for ${pkg.url} (expected $expected, got $actual)")
-                    }
-                }
                 extractDebForAapt2(debFile, targetFile, libDir)
             } finally {
                 debFile.delete()
@@ -213,31 +190,18 @@ class ComponentDownloadManager @Inject constructor(
     }
 
     /**
-     * A resolved Termux package: its download URL plus the expected SHA256 from
-     * the Packages index when available. [sha256] is null for fallback URLs
-     * (we couldn't fetch the index), in which case the download isn't checksum-
-     * verified — the same best-effort behavior as before.
+     * Looks up current download URLs for a set of Termux package names by
+     * parsing the repo's Packages index. Falls back to a guessed URL pattern
+     * if the index lookup fails — that covers offline/proxy scenarios but will
+     * 404 if Termux rolled a new version since the fallback pattern was pinned.
      */
-    private data class TermuxPkgRef(val url: String, val sha256: String?)
-
-    /**
-     * Looks up current download URLs (and SHA256 checksums) for a set of Termux
-     * package names by parsing the repo's Packages index over HTTPS. Falls back
-     * to a guessed URL pattern if the index lookup fails — that covers offline/
-     * proxy scenarios but will 404 if Termux rolled a new version since the
-     * fallback pattern was pinned (and yields no checksum to verify against).
-     */
-    private fun resolvePackageUrls(repo: String, arch: String, packageNames: List<String>): List<TermuxPkgRef> {
+    private fun resolvePackageUrls(repo: String, arch: String, packageNames: List<String>): List<String> {
         val indexUrl = "$repo/dists/stable/main/binary-$arch/Packages"
         val indexContent = try {
-            val request = Request.Builder().url(indexUrl).build()
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) response.body?.string() ?: "" else ""
-            }
+            java.net.URL(indexUrl).openStream().bufferedReader().use { it.readText() }
         } catch (_: Exception) { "" }
 
         val filenameByPkg = mutableMapOf<String, String>()
-        val sha256ByPkg = mutableMapOf<String, String>()
         if (indexContent.isNotEmpty()) {
             var currentPkg = ""
             for (line in indexContent.lines()) {
@@ -246,31 +210,14 @@ class ComponentDownloadManager @Inject constructor(
                         currentPkg = line.removePrefix("Package: ").trim()
                     line.startsWith("Filename: ") ->
                         filenameByPkg[currentPkg] = line.removePrefix("Filename: ").trim()
-                    line.startsWith("SHA256: ") ->
-                        sha256ByPkg[currentPkg] = line.removePrefix("SHA256: ").trim()
                 }
             }
         }
 
         return packageNames.map { pkg ->
             val filename = filenameByPkg[pkg]
-            if (filename != null) TermuxPkgRef("$repo/$filename", sha256ByPkg[pkg])
-            else TermuxPkgRef(fallbackTermuxUrl(repo, arch, pkg), null)
+            if (filename != null) "$repo/$filename" else fallbackTermuxUrl(repo, arch, pkg)
         }
-    }
-
-    /** Lowercase hex SHA256 of a file. */
-    private fun sha256Of(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).buffered().use { input ->
-            val buf = ByteArray(8192)
-            while (true) {
-                val read = input.read(buf)
-                if (read <= 0) break
-                digest.update(buf, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**
