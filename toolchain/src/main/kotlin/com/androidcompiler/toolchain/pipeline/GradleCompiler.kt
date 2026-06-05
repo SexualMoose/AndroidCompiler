@@ -57,6 +57,29 @@ class GradleCompiler @Inject constructor(
             "error while loading shared libraries",
             "cannot execute binary file"
         )
+
+        /**
+         * Substrings indicating a POSIX permission/owner op the filesystem rejected
+         * — the signature of building on EXTERNAL storage (/storage/emulated/0 is
+         * sdcardfs/FUSE and rejects chmod/mkdir-with-mode). vc7+ redirects build
+         * outputs to internal ext4 to PREVENT this; if it still appears, the project
+         * itself is writing into its own (external) source tree during the build, so
+         * we surface a clear, actionable message instead of a raw Gradle stacktrace.
+         */
+        private val STORAGE_PERMISSION_MARKERS = listOf(
+            "Could not set file mode",
+            "Could not create directory",
+            "Failed to create parent directory",
+            "Could not chmod",
+            "Operation not permitted",
+            "Read-only file system"
+        )
+    }
+
+    /** True if the build failed on a filesystem permission op (external-storage chmod). */
+    private fun isStoragePermissionFailure(result: ProcessResult): Boolean {
+        val out = result.stderr + "\n" + result.stdout
+        return STORAGE_PERMISSION_MARKERS.any { out.contains(it, ignoreCase = true) }
     }
 
     /** Tee a line to both the in-app log UI and logcat/persistent file. */
@@ -416,7 +439,18 @@ exec '${realBin.absolutePath}' "${'$'}@"
             logBoth(onLog,
                 "Gradle build failed (exit ${result.exitCode}). Full output in last_compile.log / gradle_build_output.txt",
                 ErrorSeverity.ERROR)
-            val errors = parseGradleErrors(allOutput)
+            val errors = parseGradleErrors(allOutput).toMutableList()
+            if (isStoragePermissionFailure(result)) {
+                logBoth(onLog,
+                    "Detected a filesystem-permission failure (chmod/mkdir rejected) — the hallmark of " +
+                    "building on external storage (sdcardfs/FUSE doesn't support POSIX modes).",
+                    ErrorSeverity.ERROR)
+                errors.add(0, CompilationError("Storage", ErrorSeverity.ERROR,
+                    "The filesystem rejected a permission operation (e.g. \"could not set file mode 770\"). " +
+                    "Build outputs are already redirected to internal storage, so this means the PROJECT writes " +
+                    "into its own source tree on external storage during the build. Move the project onto internal " +
+                    "storage (the app's projects folder) and rebuild."))
+            }
             return@withContext StepResult.Failure(errors.ifEmpty {
                 listOf(CompilationError("Gradle", ErrorSeverity.ERROR,
                     "Build failed (exit ${result.exitCode}).\n${allOutput.takeLast(1500)}"))
