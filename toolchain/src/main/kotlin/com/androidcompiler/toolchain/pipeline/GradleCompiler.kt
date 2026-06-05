@@ -466,11 +466,63 @@ exec '${realBin.absolutePath}' "${'$'}@"
             ))
         }
 
-        val outputApk = File(outputDir, apk.name)
-        apk.copyTo(outputApk, overwrite = true)
+        val outputApk = writeOutputApk(apk, outputDir, onLog)
         logBoth(onLog, "APK: ${outputApk.name} (${outputApk.length() / 1024} KB)", ErrorSeverity.INFO)
 
         StepResult.Success(listOf(outputApk))
+    }
+
+    /**
+     * Place the built APK where it's both WRITABLE and INSTALLABLE, never crashing.
+     *
+     * The canonical copy goes to the app's external-files `output/` dir: it needs no
+     * storage permission AND it's declared in res/xml/file_paths.xml, so FileProvider
+     * can hand it to the package installer (the "Install APK" button). We then
+     * BEST-EFFORT copy to the user's chosen folder for visibility — wrapped so a
+     * scoped-storage failure there degrades to a warning instead of CRASHING.
+     *
+     * The old code did `apk.copyTo(File(outputDir, name), overwrite = true)` straight to
+     * the user's folder. On a 2nd build of a project under /storage/emulated/0/Documents,
+     * scoped storage refused to delete the existing APK, so copyTo threw
+     * FileAlreadyExistsException and took the whole app down.
+     */
+    private fun writeOutputApk(apk: File, requestedDir: File, onLog: LogCallback): File {
+        val canonicalDir = File(context.getExternalFilesDir(null), "output").apply { mkdirs() }
+        val canonical = File(canonicalDir, apk.name)
+        val primary: File = try {
+            if (canonical.absolutePath != apk.absolutePath) {
+                runCatching { if (canonical.exists()) canonical.delete() }
+                apk.copyTo(canonical, overwrite = true)
+            }
+            canonical
+        } catch (e: Exception) {  // extremely unlikely (app-owned dir) — fall back to internal
+            logBoth(onLog, "Could not write APK to app output dir (${e.message}); using internal storage",
+                ErrorSeverity.WARNING)
+            val internal = File(File(context.filesDir, "output").apply { mkdirs() }, apk.name)
+            try {
+                runCatching { if (internal.exists()) internal.delete() }
+                apk.copyTo(internal, overwrite = true)
+                internal
+            } catch (e2: Exception) {
+                logBoth(onLog, "APK copy failed (${e2.message}); returning the build-dir APK directly",
+                    ErrorSeverity.WARNING)
+                apk  // the produced APK in the (internal) build dir is itself valid
+            }
+        }
+        // Best-effort: also drop a copy in the user's requested folder (visibility only).
+        runCatching {
+            if (requestedDir.absolutePath != canonicalDir.absolutePath && requestedDir.absolutePath != primary.parentFile?.absolutePath) {
+                requestedDir.mkdirs()
+                val userCopy = File(requestedDir, apk.name)
+                runCatching { if (userCopy.exists()) userCopy.delete() }
+                apk.copyTo(userCopy, overwrite = true)
+                logBoth(onLog, "Also saved a copy to ${userCopy.absolutePath}", ErrorSeverity.INFO)
+            }
+        }.onFailure {
+            logBoth(onLog, "Couldn't also save to ${requestedDir.absolutePath} (${it.message}). " +
+                "The APK is available in-app via Install and at ${primary.absolutePath}.", ErrorSeverity.WARNING)
+        }
+        return primary
     }
 
     /**
