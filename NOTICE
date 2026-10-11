@@ -1,0 +1,95 @@
+AndroidCompiler — third-party notices
+=====================================
+
+AndroidCompiler's own source code has no license chosen yet (no LICENSE file;
+all rights reserved by default). The third-party components below are
+committed to this repository and/or bundled into every APK built from it.
+Each keeps its own license, listed here.
+
+-------------------------------------------------------------------------------
+1. OpenJDK 17 launcher binaries  (COPYLEFT — GPLv2 with Classpath Exception)
+-------------------------------------------------------------------------------
+Files (identical set for each ABI):
+  prebuilts/native-jniLibs/arm64-v8a/  and  prebuilts/native-jniLibs/x86_64/
+    libjava.so     (bin/java)
+    libjavac.so    (bin/javac)
+    libjar.so      (bin/jar)
+    libjdeps.so    (bin/jdeps)
+    libjlink.so    (bin/jlink)
+    libjmod.so     (bin/jmod)
+    libkeytool.so  (bin/keytool)
+    libjli.so      (lib/libjli.so — Java launcher infrastructure)
+
+Origin:   OpenJDK 17.0.19, as built by the Termux project (package
+          "openjdk-17", version 17.0.19, from the Termux main repository at
+          packages.termux.dev). Extracted unmodified from the .deb and renamed
+          to lib*.so by build-logic/convention/.../PrepareNativeBinariesTask.kt.
+Upstream: OpenJDK — https://openjdk.org/
+          Termux build recipe and patches — https://github.com/termux/termux-packages
+License:  GNU General Public License, version 2, with the Classpath Exception.
+
+Obligations when distributing this repository or an APK built from it:
+include the GPLv2 + Classpath Exception license text, and make the
+corresponding source available (the OpenJDK 17u sources for 17.0.19 plus the
+Termux build recipe/patches used for the "openjdk-17" package). The app runs
+these binaries as separate processes; it does not link its own code against
+them.
+
+NOT YET DONE (owner action): this repository and the APKs built from it do
+not yet contain the GPLv2 + Classpath Exception text, the Apache License 2.0
+text, or a written source offer / link for the OpenJDK 17.0.19 sources and
+the Termux openjdk-17 / aapt2 build recipes at the exact revisions used. This
+NOTICE file is also not packaged into the APK. Until the texts (e.g. under
+licenses/) and the source offer are added, the obligations above are not met.
+
+-------------------------------------------------------------------------------
+2. AAPT2 (Android Asset Packaging Tool 2)  (Apache License 2.0)
+-------------------------------------------------------------------------------
+Files:
+  prebuilts/native-jniLibs/arm64-v8a/libaapt2.so
+  prebuilts/native-jniLibs/x86_64/libaapt2.so
+Origin:   Android Open Source Project build tools, as built by the Termux
+          project (package "aapt2", version 13.0.0.6-23). Extracted unmodified
+          from the .deb and renamed to libaapt2.so.
+Upstream: https://source.android.com/
+          Termux build recipe and patches — https://github.com/termux/termux-packages
+License:  Apache License, Version 2.0.
+
+-------------------------------------------------------------------------------
+3. Gradle Wrapper  (Apache License 2.0)
+-------------------------------------------------------------------------------
+Files:    gradle/wrapper/gradle-wrapper.jar, gradlew, gradlew.bat
+Origin:   Gradle Wrapper (the wrapper properties point at Gradle 8.11.1;
+          the jar itself carries no version). Copyright the original authors.
+License:  Apache License, Version 2.0 (SPDX header in gradlew).
+
+-------------------------------------------------------------------------------
+Not bundled — downloaded by the user's device at runtime
+-------------------------------------------------------------------------------
+The app downloads the following directly from their upstream repositories on
+the device; they are not committed here or packaged in the APK:
+  - Eclipse Compiler for Java (ecj) 3.39.0 ............ EPL-2.0
+  - Kotlin compiler-embeddable / stdlib / script-runtime 2.1.0 ... Apache-2.0
+  - R8 / D8 8.9.35 ...................................... BSD-3-Clause
+  - Gradle wrapper / distributions ...................... Apache-2.0
+  - Android platform-34 ZIP (android.jar; code to download API 29-35
+    variants exists but is never called) ................ Android SDK terms
+  - Termux "openjdk-17" runtime, pinned to 17.0.19 (the pinned file
+    returned 404 when checked on 2026-10-10; the pool now has 17.0.20)
+    ..................................................... GPLv2 + Classpath Exception
+  - Termux "aapt2" and "aapt" packages, latest version from the live
+    index (currently 16.0.0.4-2) ........................ Apache-2.0
+  - Termux library packages, resolved from the live Packages index, so
+    the set and versions can change. Currently: libc++, zlib, libiconv,
+    libjpeg-turbo, libandroid-shmem, libandroid-spawn, littlecms (MIT),
+    alsa-plugins and its dependencies (alsa-lib, pulseaudio,
+    libandroid-sysv-semaphore), libprotobuf, abseil-cpp, fmt, libexpat,
+    libpng, libzopfli ................................... various (unverified)
+
+Library dependencies resolved by Gradle (AndroidX, Jetpack Compose, Hilt/Dagger,
+kotlinx-coroutines, kotlinx-serialization, OkHttp, apksig — Apache-2.0; XZ for
+Java 1.10 — 0BSD) are listed in PROJECT-DOCUMENTATION.md.
+
+Trademarks: "Android" is a trademark of Google LLC; "Claude" is a trademark of
+Anthropic; "Termux", "Gradle", "Kotlin", "Eclipse" and "OpenJDK"/"Java" belong
+to their respective owners and are referenced descriptively.
