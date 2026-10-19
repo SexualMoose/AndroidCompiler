@@ -5,7 +5,8 @@ On-device Android APK compiler: a native Android app that builds Gradle-based An
 bundling the OpenJDK 17 launcher binaries and AAPT2 inside its own APK and downloading the rest of
 the toolchain at runtime.
 
-_Last audited: 2026-10-10 against main @ 94bab3a (review fixes 2026-10-11)._
+_Last audited: 2026-10-10 against main @ 94bab3a (review fixes 2026-10-11); updated 2026-10-19 for
+**1.1.11 (versionCode 13)**, which adds FleetReporter crash, freeze and error reports._
 
 ## Overview / Purpose
 
@@ -37,8 +38,11 @@ commits since 2026-06-27). Evidence (as of 2026-10-10):
   `ChunkedDownloader` fails on a non-2xx response, so the JDK never reaches *Installed*. A fresh
   install therefore stays on the Setup screen and Compile refuses to run; `GradleCompiler`'s
   self-repair retry re-downloads the same dead URL. Fix steps are under Known Issues.
-- `main` @ `94bab3a` (2026-06-27, docs commit). Latest code change is `266d099` (2026-06-25):
-  version **1.1.10**, `versionCode` **12**. 33 commits in total, first on 2026-04-13.
+- **Current version: 1.1.11, `versionCode` 13** (2026-10-19). It adds FleetReporter (crash,
+  freeze and error reports to FleetGuardian; see Crash and error reports (FleetReporter)) and does
+  not change the JDK pin, so new installs are still broken.
+- `main` @ `94bab3a` (2026-06-27, docs commit). The last code change before FleetReporter was
+  `266d099` (2026-06-25): version 1.1.10, `versionCode` 12. 33 commits in total, first on 2026-04-13.
 - History is a coherent engineering narrative: scaffolding → pipeline → repeated rounds of fixing
   real on-device problems (SIGABRT/SELinux/noexec, AAPT2 `.so` extraction, launcher↔`libjvm.so`
   patch matching, external-storage chmod failures, progress-bar wiring, APK-save crash).
@@ -240,7 +244,8 @@ Diagnostics: logcat tag `ACBuild`; persistent `last_compile.log` (rotated at 1 M
 Multi-module Gradle project (Hilt DI, MVVM + Compose). Modules from `settings.gradle.kts`:
 
 - `app/` — `AndroidCompilerApplication`, `MainActivity`, `MainViewModel`, `navigation/AppNavHost`
-  (Setup route + 4 bottom-bar tabs), manifest, resources/icons.
+  (Setup route + 4 bottom-bar tabs), `fleet/FleetReporter` (crash and error reports, see below),
+  manifest, resources/icons.
 - `core/common/` — models (`CompilationState`, `ToolchainComponent`, `Settings`, `ThemeMode`,
   `HardwareMetrics`) and `UriPathResolver` (SAF tree URI → file path).
 - `core/data/` — `SettingsRepository` / `DataStoreSettingsRepository` (DataStore `settings`) +
@@ -317,10 +322,31 @@ The APK is then handed through `FileProvider` to the system installer.
   therefore cannot work around the dead JDK download.
 - **Android system** — `PackageInstaller` (via `FileProvider`), Storage Access Framework pickers,
   clipboard, `PerformanceHintManager`, `ConnectivityManager`.
-- **Portfolio repos:** none referenced in code. The app contains no fleet-server client,
-  self-update or telemetry code. Release builds for the owner's own devices are produced and signed
+- **Portfolio repos:** only FleetGuardian, the fleet manager app, which FleetReporter reports to on
+  the same phone (see Crash and error reports (FleetReporter)). The app contains no fleet-server
+  client or self-update code. Release builds for the owner's own devices are produced and signed
   by separate, self-hosted release tooling outside this repo.
 - No cloud AI API is called; the "Claude Fix Prompt" feature only copies text to the clipboard.
+
+## Crash and error reports (FleetReporter)
+
+`app/src/main/kotlin/com/androidcompiler/fleet/FleetReporter.kt`, installed in
+`AndroidCompilerApplication.onCreate()` since 1.1.11 (versionCode 13), reports problems to
+FleetGuardian on the same phone:
+
+- **What:** crashes (uncaught exceptions), freezes (ANR: the main thread blocked for more than
+  5 s), and errors and warnings the app logs on purpose (`FleetReporter.error` / `warn` /
+  `report`).
+- **Where:** FleetGuardian's health provider (`content://com.sexualmoose.fleetguardian.health`,
+  method `report_issue`; the manifest's `<queries>` entry makes it visible on Android 11+). No
+  network call is made. FleetGuardian forwards the reports to the Jarvis server's Reports, and a
+  fatal one (a crash or a freeze) can start an automatic fix.
+- **Redaction:** emails, tokens and secrets (`password=`-style values, cookie headers, long
+  hex/base64 runs) are redacted in the title, message, stack and logcat tail before a report
+  leaves the app.
+- **Without FleetGuardian 0.3.0+** on the phone, reports wait in `filesDir/fleetreporter/queue/`
+  (at most 50, oldest dropped) and are resent at the next start; nothing else changes.
+- Spec: FleetGuardian's `docs/fleet-reporter/README.md` (dev hub contract section 6).
 
 ## Configuration & Secrets
 
@@ -430,7 +456,7 @@ The APK is then handed through `FileProvider` to the system installer.
   first requires the app's own version-matched JDK.
 - `gradlew` is committed without the executable bit (mode `100644`), so `./gradlew` fails with
   "permission denied" on macOS/Linux until you run `chmod +x gradlew` (or use `sh gradlew`).
-- Settings → About shows a hard-coded "v1.0.0" (actual `versionName` is 1.1.10).
+- Settings → About shows a hard-coded "v1.0.0" (actual `versionName` is 1.1.11).
 - `app/src/main/res/drawable-nodpi/splash.png` (~1 MB) is not referenced anywhere.
 - Toolchain-download integrity hardening is an open TODO (see Security notes).
 - No automated tests; no CI; no LICENSE (see below).
@@ -491,6 +517,9 @@ The APK is then handed through `FileProvider` to the system installer.
   in app-private storage.
 - **Secrets:** none in the repo; release-signing keys for AndroidCompiler itself live outside the
   repo.
+- **Crash reports:** FleetReporter sends crash, freeze, error and warning reports (title, message,
+  stack, signature, versionCode and this process's own logcat tail, redacted first) only to
+  FleetGuardian on the same phone, over its content provider. No files or device ids are sent.
 - **Posture:** default OkHttp TLS validation, a zip-slip guard on extraction, no WebView/JS
   bridge, only the launcher activity exported, `FileProvider` not exported and limited to the
   app's own `toolchain/`, `compiled/` and `output/` directories.

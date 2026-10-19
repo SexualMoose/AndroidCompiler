@@ -8,6 +8,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- Package visibility for FleetGuardian's health endpoint: crash / freeze / error reports
+         (dev hub contract section 6, FleetReporter.kt). -->
+    <queries>
+        <provider android:authorities="com.sexualmoose.fleetguardian.health" />
+    </queries>
+
     <application
         android:name=".AndroidCompilerApplication"
         android:allowBackup="true"

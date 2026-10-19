@@ -7,9 +7,9 @@ downloading the rest of the toolchain at runtime. No root and no Termux install 
 **Status:** **broken for new installs.** Termux replaced `openjdk-17` 17.0.19 with 17.0.20 (the
 pinned 17.0.19 `.deb` returned 404 when checked on 2026-10-10), so a fresh install cannot finish
 first-run setup. Devices that already downloaded 17.0.19 still work. Otherwise maintenance-only:
-v1.1.10 (versionCode 12); the on-device Gradle (`assembleDebug`) path is the one that has been
-exercised. No tests, no CI. Details and the fix steps:
-[PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md).
+**v1.1.11 (versionCode 13)**, which adds FleetReporter crash, freeze and error reports (below); the
+on-device Gradle (`assembleDebug`) path is the one that has been exercised. No tests, no CI.
+Details and the fix steps: [PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md).
 
 ## Quickstart
 
@@ -30,6 +30,16 @@ On the device: first launch → **Download All Components** (the Setup screen sa
 **Currently broken on a fresh install:** the OpenJDK download fails with HTTP 404, so the app never
 gets past the Setup screen until the JDK pin is bumped and the APK is rebuilt (see Known Issues
 in [PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md)).
+
+## Crash and error reports (FleetReporter)
+
+Since 1.1.11, `app/src/main/kotlin/com/androidcompiler/fleet/FleetReporter.kt` (installed in
+`AndroidCompilerApplication.onCreate()`) reports crashes, freezes (ANR: the main thread blocked
+for more than 5 s) and the errors and warnings the app logs on purpose to FleetGuardian, the fleet
+manager app on the same phone. FleetGuardian forwards them to the Jarvis server's Reports, and a
+fatal one can start an automatic fix. Emails, tokens and other secrets are redacted before a report
+leaves the app. Without FleetGuardian 0.3.0+ on the phone, reports wait in a queue of at most 50
+and nothing else changes. Details: [PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md).
 
 ## License
 
