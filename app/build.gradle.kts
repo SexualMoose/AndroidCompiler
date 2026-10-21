@@ -58,8 +58,8 @@ android {
         // bundled in the APK's native library dir, which is exec-allowed for
         // every targetSdk. See app/src/main/jniLibs/arm64-v8a/lib*.so.
         targetSdk = 35
-        versionCode = 13
-        versionName = "1.1.11"
+        versionCode = 14
+        versionName = "1.1.12"
         // Exposed to runtime so the in-app UI / diagnostics can show which JDK
         // the APK's launcher was built against. The authoritative runtime pin
         // for the JDK DOWNLOAD lives in the :toolchain module's BuildConfig

@@ -33,6 +33,8 @@ in [PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md)).
 
 ## Crash and error reports (FleetReporter)
 
+**FleetReporter 1.1** (1.1.12, versionCode 14, 2026-10-20): The freeze watchdog runs only while the app is on screen; on Android 11+ the freezes and native crashes it misses arrive from Android's exit records at the next start; reports go only to FleetGuardian signed with the fleet release key; UUIDs and MAC addresses are redacted; and each queued report is sent by exactly one process. Details: FleetGuardian `docs/fleet-reporter/README.md`.
+
 Since 1.1.11, `app/src/main/kotlin/com/androidcompiler/fleet/FleetReporter.kt` (installed in
 `AndroidCompilerApplication.onCreate()`) reports crashes, freezes (ANR: the main thread blocked
 for more than 5 s) and the errors and warnings the app logs on purpose to FleetGuardian, the fleet

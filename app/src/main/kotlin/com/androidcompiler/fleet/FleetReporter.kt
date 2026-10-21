@@ -1,6 +1,12 @@
 package com.androidcompiler.fleet
 
+import android.annotation.TargetApi
+import android.app.Activity
+import android.app.ActivityManager
+import android.app.Application
+import android.app.ApplicationExitInfo
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -12,11 +18,12 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.io.PrintWriter
 import java.io.StringWriter
 import java.security.MessageDigest
 import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
+import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -27,15 +34,15 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.system.exitProcess
 
 /**
- * FleetReporter: crashes, freezes (ANRs), errors and warnings for FleetGuardian on the same phone (dev hub
- * contract, section 6). Copy-in: one file, no dependencies, no permissions, minSdk 26. No public call throws.
+ * FleetReporter 1.1: crashes, freezes (ANRs), errors and warnings for FleetGuardian on the same phone (dev hub
+ * contract, section 6). Copy-in: one file, no dependencies, no permissions, minSdk 23. No public call throws.
  * See docs/fleet-reporter/README.md in the FleetGuardian repo.
  *
  *   class MyApp : Application() {
  *       override fun onCreate() {
  *           super.onCreate()
  *           FleetHealth.install(this)     // only if the app has FleetHealth
- *           FleetReporter.install(this)
+ *           FleetReporter.install(this)   // or install(this, FleetReporter.Options(watchdog = FleetReporter.Watchdog.OFF))
  *       }
  *   }
  *
@@ -43,15 +50,29 @@ import kotlin.system.exitProcess
  *   FleetReporter.warn("Sync", "server slow, retrying")
  *   FleetReporter.report(e)                            // a caught exception worth a look
  *
- * The functions marked `internal` below (signature, redaction, caps, rate limiter, queue trimming, watchdog
- * state) are pure JVM code so the app's unit tests can cover them.
+ * The functions marked `internal` below (signature, redaction, caps, rate limiter, queue, watchdog state, exit
+ * records, receiver check) are pure JVM code or thin platform glue, so the app's unit tests can cover them.
  */
 object FleetReporter {
+    /** This file's version. The fleet rollout looks for "FleetReporter/<VERSION>" in every built APK. */
+    const val VERSION = "1.1"
+
     // FleetGuardian's HealthReportProvider: call("report_issue", null, extras) -> Bundle { ok, message, retry? }.
     private const val AUTHORITY = "com.sexualmoose.fleetguardian.health"
     private const val METHOD = "report_issue"
     private const val PROTOCOL = 1
+    private const val AGENT = "FleetReporter/$VERSION"
     private const val TAG = "FleetReporter"
+
+    /**
+     * Reports go only to this package, and only while every certificate it is signed with is one of these: the
+     * fleet release key. A key rotation adds the new key's fingerprint here. Anything else holding the authority
+     * (possible while FleetGuardian is not installed) gets nothing, and the report waits in the queue.
+     */
+    internal const val RECEIVER_PACKAGE = "com.sexualmoose.fleetguardian"
+    internal val RECEIVER_CERT_SHA256: Set<String> = setOf(
+        "4be7b157904f22a8bb06642e24e7e1c97057234a81adca3e0bcacbb024902c60", // fleet release key
+    )
 
     internal const val KIND_CRASH = "crash"
     internal const val KIND_ANR = "anr"
@@ -68,21 +89,54 @@ object FleetReporter {
     internal const val ANR_THRESHOLD_MS = 5_000L
     internal const val STARTUP_WINDOW_MS = 5_000L
     internal const val SIGNATURE_FRAMES = 5
+    internal const val STALE_MS = 10 * 60_000L // an abandoned .tmp or claim in the queue
+    internal const val EXIT_REASON_CRASH_NATIVE = 5 // ApplicationExitInfo.REASON_CRASH_NATIVE
+    internal const val EXIT_REASON_ANR = 6 // ApplicationExitInfo.REASON_ANR
     private const val LOG_LINES = 400
     private const val LOG_TIMEOUT_MS = 1_500L
     private const val CRASH_BUDGET_MS = 2_000L
     private const val CALL_TIMEOUT_MS = 5_000L
     private const val WATCHDOG_TICK_MS = 1_000L
+    private const val EXIT_RECORDS_MAX = 16
+    private const val EXIT_TRACE_MAX_BYTES = 512 * 1024
+
+    /** Where the main-thread freeze watchdog runs. */
+    enum class Watchdog {
+        /** Only while one of the app's activities is started (the default): nothing runs in the background. */
+        FOREGROUND,
+
+        /** For the life of the process, as FleetReporter 1.0 did. */
+        ALWAYS,
+
+        /** Never. Freezes still reach FleetGuardian from Android's exit records (Android 11+) at the next start. */
+        OFF,
+    }
+
+    /**
+     * install() settings.
+     *
+     * [extraRedactions]: (regex, replacement) pairs applied after the built-in rules to every text a report
+     * carries. The replacement may use `$1` group references (write `\\$` for a literal dollar). The patterns are
+     * compiled on first use; one that doesn't compile turns every text field into "[redacted: no regex support]"
+     * (fails closed) and never breaks install(). Android's regex engine (ICU) is stricter than the JVM's: inside
+     * [...] escape every '-', '$', '&', brace and parenthesis, and never start a class with ':'.
+     */
+    class Options(
+        val watchdog: Watchdog = Watchdog.FOREGROUND,
+        val extraRedactions: List<Pair<String, String>> = emptyList(),
+    )
 
     @Volatile private var app: Context? = null
     @Volatile private var prefixes: List<String> = emptyList()
     @Volatile private var versionCode = -1L
     @Volatile private var processStart = 0L // SystemClock.elapsedRealtime() when this process started
+    @Volatile private var anrReported = false // this process's watchdog reported a freeze (see the exit records)
+    @Volatile private var extraSpecs: List<Pair<String, String>> = emptyList()
+    @Volatile private var extraRules: List<Pair<Regex, String>>? = null
+    private var watchdogThread: Thread? = null // guarded by this
     private val crashing = AtomicBoolean(false)
-    private val watchdogStarted = AtomicBoolean(false)
     private val limiter = RateLimiter(RATE_WINDOW_MS)
     private val fileSeq = AtomicInteger()
-    private val inflight: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
     private val selfName: String = FleetReporter::class.java.name
 
     // An R8/ProGuard-minified build renames this class, and moves most app classes out of the app's packages.
@@ -99,25 +153,37 @@ object FleetReporter {
 
     /**
      * Call once in Application.onCreate (after FleetHealth.install when the app has it). Chains an uncaught
-     * exception handler, starts the main-thread watchdog and resends reports queued by earlier runs.
+     * exception handler, runs the main-thread watchdog as [Options.watchdog] says, resends reports queued by
+     * earlier runs and, on Android 11+, reports the freezes and native crashes Android recorded for earlier runs.
      */
-    fun install(context: Context) {
+    fun install(context: Context, options: Options = Options()) {
         try {
             val ctx = context.applicationContext ?: context
             synchronized(this) {
                 if (app === ctx) return
-                processStart = try {
+                processStart = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     android.os.Process.getStartElapsedRealtime()
-                } catch (_: Throwable) {
+                } else {
                     SystemClock.elapsedRealtime()
                 }
                 versionCode = readVersionCode(ctx)
                 prefixes = appPackagePrefixes(ctx.packageName, ctx.javaClass.name, context.javaClass.name, selfName)
+                useExtraRedactions(options.extraRedactions)
+                anrReported = false
                 Thread.setDefaultUncaughtExceptionHandler(CrashHandler(Thread.getDefaultUncaughtExceptionHandler()))
                 app = ctx
             }
-            if (watchdogStarted.compareAndSet(false, true)) startWatchdog()
-            worker.execute { flushQueue() }
+            noteProcessState(ctx)
+            stopWatchdog()
+            when (options.watchdog) {
+                Watchdog.ALWAYS -> startWatchdog()
+                Watchdog.FOREGROUND -> (ctx as? Application)?.registerActivityLifecycleCallbacks(ForegroundWatch())
+                Watchdog.OFF -> Unit
+            }
+            worker.execute {
+                flushQueue()
+                reportExitRecords()
+            }
         } catch (_: Throwable) {
         }
     }
@@ -231,32 +297,76 @@ object FleetReporter {
         }
     }
 
-    private fun startWatchdog() {
-        val t = Thread({
+    /**
+     * Watchdog.FOREGROUND: the watchdog runs while at least one activity is started. A set, not a counter, so an
+     * unbalanced start or stop can't leave it running. Callbacks come on the main thread.
+     */
+    private class ForegroundWatch : Application.ActivityLifecycleCallbacks {
+        private val started: MutableSet<Activity> = Collections.newSetFromMap(WeakHashMap())
+
+        override fun onActivityStarted(activity: Activity) {
             try {
-                val main = Handler(Looper.getMainLooper())
-                val acked = AtomicBoolean(true)
-                val ping = Runnable { acked.set(true) }
-                val detector = AnrDetector(ANR_THRESHOLD_MS, WATCHDOG_TICK_MS * 3)
-                while (true) {
-                    val now = SystemClock.uptimeMillis()
-                    when (detector.tick(now, acked.get())) {
-                        AnrDetector.Step.PING -> {
-                            acked.set(false)
-                            main.post(ping)
-                        }
-                        AnrDetector.Step.REPORT ->
-                            if (!crashing.get() && !Debug.isDebuggerConnected()) onAnr(detector.blockedMs(now))
-                        AnrDetector.Step.WAIT -> Unit
-                    }
-                    Thread.sleep(WATCHDOG_TICK_MS)
-                }
+                if (started.add(activity) && started.size == 1) startWatchdog()
             } catch (_: Throwable) {
-                // Interrupted or anything unexpected: the watchdog stops; the app is unaffected.
             }
-        }, "fleet-reporter-watchdog")
-        t.isDaemon = true
-        t.start()
+        }
+
+        override fun onActivityStopped(activity: Activity) {
+            try {
+                if (started.remove(activity) && started.isEmpty()) stopWatchdog()
+            } catch (_: Throwable) {
+            }
+        }
+
+        override fun onActivityDestroyed(activity: Activity) = onActivityStopped(activity)
+        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+        override fun onActivityResumed(activity: Activity) = Unit
+        override fun onActivityPaused(activity: Activity) = Unit
+        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+    }
+
+    private fun startWatchdog() {
+        synchronized(this) {
+            if (watchdogThread?.isAlive == true) return
+            val t = Thread({ runWatchdog() }, "fleet-reporter-watchdog")
+            t.isDaemon = true
+            watchdogThread = t
+            t.start()
+        }
+    }
+
+    internal fun stopWatchdog() {
+        synchronized(this) {
+            watchdogThread?.interrupt()
+            watchdogThread = null
+        }
+    }
+
+    /** Whether a watchdog thread is running now. */
+    internal fun watchdogRunning(): Boolean = synchronized(this) { watchdogThread?.isAlive == true }
+
+    private fun runWatchdog() {
+        try {
+            val main = Handler(Looper.getMainLooper())
+            val acked = AtomicBoolean(true)
+            val ping = Runnable { acked.set(true) }
+            val detector = AnrDetector(ANR_THRESHOLD_MS, WATCHDOG_TICK_MS * 3)
+            while (!Thread.currentThread().isInterrupted) {
+                val now = SystemClock.uptimeMillis()
+                when (detector.tick(now, acked.get())) {
+                    AnrDetector.Step.PING -> {
+                        acked.set(false)
+                        main.post(ping)
+                    }
+                    AnrDetector.Step.REPORT ->
+                        if (!crashing.get() && !Debug.isDebuggerConnected()) onAnr(detector.blockedMs(now))
+                    AnrDetector.Step.WAIT -> Unit
+                }
+                Thread.sleep(WATCHDOG_TICK_MS)
+            }
+        } catch (_: Throwable) {
+            // Stopped (interrupted) or anything unexpected: the watchdog ends; the app is unaffected.
+        }
     }
 
     /** Runs on the watchdog thread: grabs the main thread's stack now, the rest happens on the worker. */
@@ -267,6 +377,10 @@ object FleetReporter {
             val frames = main.stackTrace
             val state = main.state
             val occurredMs = System.currentTimeMillis()
+            if (!anrReported) {
+                anrReported = true
+                noteProcessState(ctx) // so the exit record of this process doesn't report the same freeze again
+            }
             val signature = frameSignature("ANR", frames, prefixes, minified)
             val count = limiter.acquire(signature, SystemClock.elapsedRealtime())
             if (count == 0) return
@@ -347,13 +461,210 @@ object FleetReporter {
         return raw.copyOfRange(i, raw.size)
     }
 
+    // ------------------------------------------------------------------ exit records (Android 11+)
+
+    /** What Android recorded about how one earlier process of this app ended (from ApplicationExitInfo). */
+    internal class ExitRecord(
+        val reason: Int, // ApplicationExitInfo.REASON_*
+        val timestampMs: Long,
+        val pid: Int,
+        val processName: String?,
+        val description: String?,
+        val status: Int, // the signal, for a native crash
+        val importance: Int,
+        val summary: ByteArray?, // what that process set with setProcessStateSummary (see [stateSummary])
+        val trace: String?, // an ANR's thread dump, else null
+    )
+
+    internal class ProcessState(val versionCode: Long, val anrReported: Boolean)
+
+    /** The process state each process leaves in its exit record: its versionCode, and whether the watchdog reported. */
+    internal fun stateSummary(versionCode: Long, anrReported: Boolean): ByteArray =
+        "fr1 $versionCode ${if (anrReported) 1 else 0}".toByteArray(Charsets.US_ASCII)
+
+    internal fun parseStateSummary(bytes: ByteArray?): ProcessState? = try {
+        val parts = if (bytes == null) emptyList() else String(bytes, Charsets.US_ASCII).split(' ')
+        if (parts.size == 3 && parts[0] == "fr1") ProcessState(parts[1].toLong(), parts[2] == "1") else null
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * The exit records to report, oldest first: ANRs this file's watchdog didn't report, and native crashes (the
+     * crash handler never sees those), newer than [seenUpToMs], the newest record an earlier start handled. With
+     * no [seenUpToMs] (the first start of a 1.1 build) nothing is reported: older records were 1.0's to catch.
+     */
+    internal fun exitRecordsToReport(records: List<ExitRecord>, seenUpToMs: Long?): List<ExitRecord> {
+        if (seenUpToMs == null) return emptyList()
+        return records.filter { r ->
+            r.timestampMs > seenUpToMs && when (r.reason) {
+                EXIT_REASON_CRASH_NATIVE -> true
+                EXIT_REASON_ANR -> parseStateSummary(r.summary)?.anrReported != true
+                else -> false
+            }
+        }.sortedBy { it.timestampMs }
+    }
+
+    /** The report for one exit record. An ANR gets the same signature the watchdog gives that freeze. */
+    internal fun exitIssue(r: ExitRecord, appPrefixes: Collection<String>, minified: Boolean, currentVersionCode: Long): Issue {
+        val vc = parseStateSummary(r.summary)?.versionCode?.takeIf { it > 0L } ?: currentVersionCode
+        val where = "pid ${r.pid}" + (r.processName?.let { ", process $it" } ?: "") + ", importance ${r.importance}"
+        val description = r.description.orEmpty()
+        return if (r.reason == EXIT_REASON_ANR) {
+            val section = mainThreadSection(r.trace.orEmpty())
+            val frames = anrMainFrames(section)
+            val top = frames.firstOrNull { isAppFrame(it.className, appPrefixes) }
+            Issue(
+                kind = KIND_ANR, fatal = true, startup = false,
+                title = cleanTitle(if (top != null) "ANR: main thread blocked in ${shortFrame(top)}" else "ANR: ${firstLine(description).ifEmpty { "app not responding" }}"),
+                message = cleanMessage("Android recorded an ANR when the process ended ($where): $description"),
+                stack = cleanStack(section),
+                logTail = null, occurredMs = r.timestampMs, vCode = vc,
+                signature = frameSignature("ANR", frames, appPrefixes, minified, description), count = 1,
+            )
+        } else {
+            val signal = signalName(r.status)
+            Issue(
+                kind = KIND_CRASH, fatal = true, startup = false,
+                title = cleanTitle("Native crash: $signal"),
+                message = cleanMessage("Android recorded a native crash when the process ended ($where)" + (if (description.isEmpty()) "" else ": $description")),
+                stack = "",
+                logTail = null, occurredMs = r.timestampMs, vCode = vc,
+                signature = sha1Hex("native\n$signal\n" + messageTemplate(description)), count = 1,
+            )
+        }
+    }
+
+    /** The "main" thread's block of an ANR thread dump, or the dump's start when it has none. */
+    internal fun mainThreadSection(trace: String): String = try {
+        val start = Rx.MAIN_THREAD.find(trace)?.range?.first
+        if (start == null) {
+            headChars(trace, STACK_MAX_BYTES)
+        } else {
+            trace.substring(start, trace.indexOf("\n\n", start).let { if (it < 0) trace.length else it })
+        }
+    } catch (_: Throwable) {
+        headChars(trace, STACK_MAX_BYTES)
+    }
+
+    /** The Java frames of a thread dump's "at Class.method(File:line)" lines. */
+    internal fun anrMainFrames(section: String): Array<StackTraceElement> = try {
+        section.lineSequence().mapNotNull { line ->
+            Rx.DUMP_FRAME.find(line)?.let { m ->
+                val where = m.groupValues[3]
+                val file = where.substringBefore(':').takeIf { it.isNotEmpty() && it != "Native method" && it != "Unknown Source" }
+                val lineNo = when {
+                    where == "Native method" -> -2
+                    else -> where.substringAfterLast(':', "").toIntOrNull() ?: -1
+                }
+                StackTraceElement(m.groupValues[1], m.groupValues[2], file, lineNo)
+            }
+        }.toList().toTypedArray()
+    } catch (_: Throwable) {
+        emptyArray()
+    }
+
+    internal fun signalName(signal: Int): String = when (signal) {
+        4 -> "SIGILL"
+        5 -> "SIGTRAP"
+        6 -> "SIGABRT"
+        7 -> "SIGBUS"
+        8 -> "SIGFPE"
+        11 -> "SIGSEGV"
+        31 -> "SIGSYS"
+        else -> "signal $signal"
+    }
+
+    /** Android 11+: leaves this process's [stateSummary] in its future exit record. */
+    private fun noteProcessState(ctx: Context) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                ctx.getSystemService(ActivityManager::class.java)?.setProcessStateSummary(stateSummary(versionCode, anrReported))
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Android 11+, the app's main process only: reports the ANRs and native crashes Android recorded for earlier
+     * processes of the app (see [exitRecordsToReport]), once each. The newest record seen is kept in
+     * filesDir/fleetreporter/exits-seen.
+     */
+    internal fun reportExitRecords() {
+        try {
+            val ctx = app ?: return
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isMainProcess(ctx)) return
+            val records = readExitRecords(ctx)
+            val seenFile = File(ctx.filesDir, "fleetreporter/exits-seen")
+            val seen = try {
+                seenFile.readText().trim().toLong()
+            } catch (_: Throwable) {
+                null
+            }
+            val newest = maxOf(seen ?: 0L, records.maxOfOrNull { it.timestampMs } ?: 0L)
+            if (seen == null || newest > seen) {
+                try {
+                    seenFile.parentFile?.mkdirs()
+                    seenFile.writeText(newest.toString())
+                } catch (_: Throwable) {
+                }
+            }
+            for (r in exitRecordsToReport(records, seen)) {
+                send(ctx, exitIssue(r, prefixes, minified, versionCode), CALL_TIMEOUT_MS)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun isMainProcess(ctx: Context): Boolean {
+        val name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) Application.getProcessName() else null
+        return name == null || name == ctx.packageName
+    }
+
+    @TargetApi(Build.VERSION_CODES.R)
+    private fun readExitRecords(ctx: Context): List<ExitRecord> {
+        val am = ctx.getSystemService(ActivityManager::class.java) ?: return emptyList()
+        return am.getHistoricalProcessExitReasons(ctx.packageName, 0, EXIT_RECORDS_MAX).map { info ->
+            ExitRecord(
+                reason = info.reason,
+                timestampMs = info.timestamp,
+                pid = info.pid,
+                processName = info.processName,
+                description = info.description,
+                status = info.status,
+                importance = info.importance,
+                summary = info.processStateSummary,
+                trace = if (info.reason == ApplicationExitInfo.REASON_ANR) readTrace(info) else null,
+            )
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.R)
+    private fun readTrace(info: ApplicationExitInfo): String? = try {
+        info.traceInputStream?.use { String(headBytes(it, EXIT_TRACE_MAX_BYTES), Charsets.UTF_8) }
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun headBytes(input: InputStream, max: Int): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(16 * 1024)
+        while (out.size() < max) {
+            val n = input.read(buf, 0, minOf(buf.size, max - out.size()))
+            if (n < 0) break
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
     // ------------------------------------------------------------------ delivery + queue
 
     internal enum class Outcome { DELIVERED, REJECTED, KEEP }
 
     /**
      * What to do with a report after one delivery attempt. No answer (FleetGuardian missing, busy, dead or too
-     * slow) keeps it queued; so does an explicit `retry` and an older FleetGuardian's "unknown method".
+     * slow, or not the real FleetGuardian) keeps it queued; so does an explicit `retry` and an older
+     * FleetGuardian's "unknown method".
      */
     internal fun outcomeOf(answered: Boolean, ok: Boolean, retry: Boolean, message: String?): Outcome = when {
         !answered -> Outcome.KEEP
@@ -362,51 +673,30 @@ object FleetReporter {
         else -> Outcome.REJECTED
     }
 
-    /** Write-ahead to the queue, hand to FleetGuardian within [guardMs], drop the file once it is answered. */
+    /** Write-ahead to the queue (as this process's claim), hand to FleetGuardian within [guardMs], then settle the file. */
     private fun send(ctx: Context, issue: Issue, guardMs: Long): Outcome {
-        val name = queueFileName(issue.occurredMs, android.os.Process.myPid(), fileSeq.incrementAndGet())
-        inflight.add(name)
+        val queue = Queue(queueDir(ctx), android.os.Process.myPid())
+        val claim = queue.add(queueFileName(issue.occurredMs, android.os.Process.myPid(), fileSeq.incrementAndGet()), issue.toJson())
+        val outcome = deliver(ctx, issue.toBundle(), guardMs)
+        if (claim != null) queue.release(claim, keep = outcome == Outcome.KEEP)
         try {
-            val file = persist(ctx, name, issue)
-            val outcome = deliver(ctx, issue.toBundle(), guardMs)
-            if (outcome != Outcome.KEEP) file?.delete()
-            try {
-                Log.d(TAG, "report_issue ${issue.kind} -> $outcome")
-            } catch (_: Throwable) {
-            }
-            return outcome
-        } finally {
-            inflight.remove(name)
+            Log.d(TAG, "report_issue ${issue.kind} -> $outcome")
+        } catch (_: Throwable) {
         }
+        return outcome
     }
 
     private fun queueDir(ctx: Context) = File(ctx.filesDir, "fleetreporter/queue")
 
-    private fun persist(ctx: Context, name: String, issue: Issue): File? = try {
-        val dir = queueDir(ctx)
-        if (!dir.isDirectory) dir.mkdirs()
-        val tmp = File(dir, "$name.tmp")
-        tmp.writeText(issue.toJson(), Charsets.UTF_8)
-        val file = File(dir, name)
-        if (tmp.renameTo(file)) {
-            dir.list()?.let { names -> queueOverflow(names.asList()).forEach { File(dir, it).delete() } }
-            file
-        } else {
-            tmp.delete()
-            null
-        }
-    } catch (_: Throwable) {
-        null
-    }
-
-    /** One binder call on its own thread; the caller waits at most [guardMs]. */
+    /** One binder call on its own thread, only to the real FleetGuardian; the caller waits at most [guardMs]. */
     private fun deliver(ctx: Context, extras: Bundle, guardMs: Long): Outcome {
         if (guardMs <= 0L) return Outcome.KEEP
         val answer = AtomicReference<Bundle?>()
         val done = CountDownLatch(1)
         val t = Thread({
             try {
-                if (ctx.packageManager.resolveContentProvider(AUTHORITY, 0) != null) {
+                val owner = ctx.packageManager.resolveContentProvider(AUTHORITY, 0)?.packageName
+                if (owner != null && receiverTrusted(owner, signerShas(ctx, owner))) {
                     answer.set(ctx.contentResolver.call(Uri.parse("content://$AUTHORITY"), METHOD, null, extras))
                 }
             } catch (_: Throwable) {
@@ -427,28 +717,119 @@ object FleetReporter {
         return outcomeOf(res != null, res?.getBoolean("ok", false) == true, res?.getBoolean("retry", false) == true, res?.getString("message"))
     }
 
-    /** Resends what earlier runs could not deliver, oldest first; stops at the first one FleetGuardian can't take. */
+    /** The authority's owner may receive reports: it is [RECEIVER_PACKAGE] and signed only with [RECEIVER_CERT_SHA256] keys. */
+    internal fun receiverTrusted(owner: String?, signerShas: Collection<String>): Boolean =
+        owner == RECEIVER_PACKAGE && signerShas.isNotEmpty() && signerShas.all { it in RECEIVER_CERT_SHA256 }
+
+    /** SHA-256 of each certificate the installed [pkg] is signed with now; empty before Android 9 (FleetGuardian needs 9). */
+    internal fun signerShas(ctx: Context, pkg: String): Set<String> = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            @Suppress("DEPRECATION")
+            val info = ctx.packageManager.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES)
+            info.signingInfo?.apkContentsSigners?.map { hexDigest("SHA-256", it.toByteArray()) }?.toSet().orEmpty()
+        } else {
+            emptySet()
+        }
+    } catch (_: Throwable) {
+        emptySet()
+    }
+
+    /** Resends what earlier runs (of any of the app's processes) could not deliver, oldest first. */
     private fun flushQueue() {
         try {
             val ctx = app ?: return
-            val dir = queueDir(ctx)
-            val names = dir.list()?.asList() ?: return
-            for (n in names) if (n.endsWith(".tmp") && n.removeSuffix(".tmp") !in inflight) File(dir, n).delete()
-            val dropped = queueOverflow(names).toSet()
-            dropped.forEach { File(dir, it).delete() }
-            for (name in queuedFiles(names)) {
-                if (name in dropped || name in inflight) continue
-                val file = File(dir, name)
+            Queue(queueDir(ctx), android.os.Process.myPid()).drain(System.currentTimeMillis()) { file ->
                 val extras = try {
                     Issue.fromJson(file.readText(Charsets.UTF_8)).toBundle()
                 } catch (_: Throwable) {
-                    file.delete() // unreadable: drop it
-                    continue
+                    return@drain Outcome.REJECTED // unreadable: drop it
                 }
-                if (deliver(ctx, extras, CALL_TIMEOUT_MS) == Outcome.KEEP) return
-                file.delete()
+                deliver(ctx, extras, CALL_TIMEOUT_MS)
             }
         } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * The queue folder, shared by all of the app's processes. A report is sent only by the process that claimed it,
+     * by renaming `<name>.json` to `<name>.json.claim-<pid>`: exactly one rename can win. A claim left by a process
+     * that died is taken back after [STALE_MS]; a `.tmp` (a write in progress) is deleted only once that old.
+     * [rename] is Android's rename(2), where exactly one of two processes renaming the same file wins.
+     */
+    internal class Queue(
+        private val dir: File,
+        private val pid: Int,
+        private val rename: (File, File) -> Boolean = { from, to -> from.renameTo(to) },
+    ) {
+        private val suffix = "$CLAIM$pid"
+
+        /** Write-ahead: [json] lands as this process's claim, so no other process sends it meanwhile. */
+        fun add(name: String, json: String): File? = try {
+            if (!dir.isDirectory) dir.mkdirs()
+            val tmp = File(dir, "$name.tmp")
+            tmp.writeText(json, Charsets.UTF_8)
+            val claim = File(dir, name + suffix)
+            if (rename(tmp, claim)) {
+                dir.list()?.let { names -> queueOverflow(names.asList()).forEach { File(dir, it).delete() } }
+                claim
+            } else {
+                tmp.delete()
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+
+        /** This process's [claim] back in the queue ([keep]: it will be resent) or gone. */
+        fun release(claim: File, keep: Boolean) {
+            try {
+                if (keep) rename(claim, File(dir, claim.name.substringBefore(CLAIM))) else claim.delete()
+            } catch (_: Throwable) {
+            }
+        }
+
+        /** Claims the queued report [name]; null when another process already has it. */
+        fun claim(name: String, nowMs: Long): File? {
+            val claim = File(dir, name + suffix)
+            if (!rename(File(dir, name), claim)) return null
+            claim.setLastModified(nowMs) // the claim's age is what counts, not the report's
+            return claim
+        }
+
+        /** Deletes abandoned .tmp files and takes back abandoned claims, both once [STALE_MS] old. */
+        fun sweep(nowMs: Long) {
+            for (n in dir.list().orEmpty()) {
+                val f = File(dir, n)
+                // 0 = unknown (the file is being renamed or deleted right now): never stale.
+                val stale = f.lastModified().let { it > 0L && nowMs - it >= STALE_MS }
+                when {
+                    n.endsWith(".tmp") -> if (stale) f.delete()
+                    n.contains(CLAIM) && !n.endsWith(suffix) -> if (stale) rename(f, File(dir, n.substringBefore(CLAIM)))
+                }
+            }
+        }
+
+        /** Sends the unclaimed reports, oldest first, until [send] says KEEP (FleetGuardian can't take one now). */
+        fun drain(nowMs: Long, send: (File) -> Outcome) {
+            sweep(nowMs)
+            val names = dir.list()?.asList() ?: return
+            val dropped = queueOverflow(names).toSet()
+            dropped.forEach { File(dir, it).delete() }
+            for (name in queuedFiles(names)) {
+                if (name in dropped) continue
+                val claim = claim(name, nowMs) ?: continue
+                val outcome = try {
+                    send(claim)
+                } catch (_: Throwable) {
+                    Outcome.KEEP
+                }
+                release(claim, keep = outcome == Outcome.KEEP)
+                if (outcome == Outcome.KEEP) return
+            }
+        }
+
+        companion object {
+            const val CLAIM = ".claim-"
         }
     }
 
@@ -457,7 +838,7 @@ object FleetReporter {
         occurredMs.coerceAtLeast(0L).toString().padStart(15, '0') + "-" +
             pid.toString().padStart(7, '0') + "-" + seq.toString().padStart(6, '0') + ".json"
 
-    /** Queued report files, oldest first. */
+    /** Queued (unclaimed) report files, oldest first. */
     internal fun queuedFiles(names: Collection<String>): List<String> = names.filter { it.endsWith(".json") }.sorted()
 
     /** The oldest queued files to delete so at most [max] remain. */
@@ -493,6 +874,7 @@ object FleetReporter {
             putLong("vCode", vCode)
             putString("signature", signature)
             putInt("count", count)
+            putString("reporter", AGENT)
         }
 
         fun toJson(): String = JSONObject().apply {
@@ -617,7 +999,7 @@ object FleetReporter {
     internal fun messageSignature(tag: String, message: String): String = sha1Hex(tag + "\n" + messageTemplate(message))
 
     internal fun messageTemplate(message: String): String = try {
-        var s = redact(headChars(message, 4096))
+        var s = redact(headChars(message, 4096)).replace(UUID_MARK, "#").replace(MAC_MARK, "#")
         s = Rx.UUID.replace(s, "#")
         s = Rx.HEX_LITERAL.replace(s, "#")
         s = Rx.HEXISH_WORD.replace(s, "#")
@@ -637,8 +1019,10 @@ object FleetReporter {
         return out
     }
 
-    internal fun sha1Hex(s: String): String {
-        val digest = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+    internal fun sha1Hex(s: String): String = hexDigest("SHA-1", s.toByteArray(Charsets.UTF_8))
+
+    private fun hexDigest(algorithm: String, bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance(algorithm).digest(bytes)
         val hex = "0123456789abcdef"
         val sb = StringBuilder(digest.size * 2)
         for (b in digest) {
@@ -680,6 +1064,9 @@ object FleetReporter {
     private const val KEY_CHAR = "[A-Za-z0-9_.\\-]"
     private const val SECRET_VALUE =
         "(\"[^\"\\r\\n]*\"|'[^'\\r\\n]*'|(?:(?:bearer|basic|digest|token)[ \\t]+)?[^\\s\"',;\\&<>\\(\\)\\{\\}\\[\\]]+)"
+    private const val HEX_PAIR = "(?:[0-9A-Fa-f]{2}|[Xx*]{2})" // a MAC byte, or one Android masked
+    internal const val UUID_MARK = "<uuid>"
+    internal const val MAC_MARK = "<mac>"
 
     /** What [redact] returns if the patterns can't run: text that could not be redacted is never handed on. */
     internal const val REDACTION_UNAVAILABLE = "[redacted: no regex support]"
@@ -725,11 +1112,42 @@ object FleetReporter {
             "(?<![A-Za-z0-9._%+\\-])[A-Za-z0-9._%+\\-]{1,64}@[A-Za-z0-9\\-]{1,63}(?:\\.[A-Za-z0-9\\-]{1,63})*\\.[A-Za-z]{2,24}\\b",
         )
         val LONG_RUN = Regex("(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{24,}={0,2}")
+
+        /** Bluetooth / Wi-Fi MAC addresses: six bytes split by one kind of ':' or '-' (Android's "XX:XX:…:AB" too). */
+        val MAC = Regex("(?<![0-9A-Za-z:\\-*])$HEX_PAIR([\\-:])(?:$HEX_PAIR\\1){4}$HEX_PAIR(?![0-9A-Za-z:\\-*])")
+
+        /** A thread dump's Java frame: "  at com.x.Y.method(Y.kt:12)", and where its main thread starts. */
+        val DUMP_FRAME = Regex("^\\s*at ([^\\s\\(]+)\\.([^\\s.\\(]+)\\(([^\\)\\r\\n]*)\\)")
+        val MAIN_THREAD = Regex("(?m)^\"main\" ")
+
+        val ALL: List<Regex>
+            get() = listOf(
+                GENERATED_NUMBER, UUID, HEX_LITERAL, HEXISH_WORD, DIGITS, SPACES, COOKIE_LINE, BEARER, JWT, API_TOKEN,
+                SECRET_ASSIGN, SECRET_FIELD, EMAIL, LONG_RUN, MAC, DUMP_FRAME, MAIN_THREAD,
+            )
+    }
+
+    /** Every built-in pattern's source, for the ICU-safety test. */
+    internal fun builtInPatterns(): List<String> = Rx.ALL.map { it.pattern }
+
+    /** The app's [Options.extraRedactions]; compiled at their first use by [redact]. */
+    internal fun useExtraRedactions(rules: List<Pair<String, String>>) {
+        extraSpecs = rules.toList()
+        extraRules = null
+    }
+
+    /** Throws when a pattern doesn't compile, which makes [redact] fail closed. */
+    private fun extraRules(): List<Pair<Regex, String>> {
+        extraRules?.let { return it }
+        val compiled = extraSpecs.map { (pattern, replacement) -> Regex(pattern) to replacement }
+        extraRules = compiled
+        return compiled
     }
 
     /**
-     * Masks emails, bearer/API tokens and JWTs, cookie headers, values of secret-looking keys, and long
-     * hex/base64 runs (24+ chars). If the patterns can't run, returns [REDACTION_UNAVAILABLE] instead of the text.
+     * Masks emails, bearer/API tokens and JWTs, cookie headers, values of secret-looking keys, UUIDs, MAC addresses
+     * and long hex/base64 runs (24+ chars), then applies the app's extra rules. If the patterns can't run, returns
+     * [REDACTION_UNAVAILABLE] instead of the text.
      */
     internal fun redact(text: String): String {
         if (text.isEmpty()) return text
@@ -741,7 +1159,11 @@ object FleetReporter {
             s = Rx.SECRET_ASSIGN.replace(s) { maskValue(it) }
             s = Rx.SECRET_FIELD.replace(s) { maskValue(it) }
             s = Rx.EMAIL.replace(s, "[email]")
-            Rx.LONG_RUN.replace(s) { if (looksSecret(it.value)) "[redacted]" else it.value }
+            s = Rx.UUID.replace(s, UUID_MARK)
+            s = Rx.MAC.replace(s, MAC_MARK)
+            s = Rx.LONG_RUN.replace(s) { if (looksSecret(it.value)) "[redacted]" else it.value }
+            for ((rule, replacement) in extraRules()) s = rule.replace(s, replacement)
+            s
         } catch (_: Throwable) {
             REDACTION_UNAVAILABLE
         }

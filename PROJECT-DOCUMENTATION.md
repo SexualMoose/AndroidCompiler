@@ -330,6 +330,8 @@ The APK is then handed through `FileProvider` to the system installer.
 
 ## Crash and error reports (FleetReporter)
 
+**FleetReporter 1.1** (1.1.12, versionCode 14, 2026-10-20): The freeze watchdog runs only while the app is on screen; on Android 11+ the freezes and native crashes it misses arrive from Android's exit records at the next start; reports go only to FleetGuardian signed with the fleet release key; UUIDs and MAC addresses are redacted; and each queued report is sent by exactly one process. Details: FleetGuardian `docs/fleet-reporter/README.md`.
+
 `app/src/main/kotlin/com/androidcompiler/fleet/FleetReporter.kt`, installed in
 `AndroidCompilerApplication.onCreate()` since 1.1.11 (versionCode 13), reports problems to
 FleetGuardian on the same phone:
